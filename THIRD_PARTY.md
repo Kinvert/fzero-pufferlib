@@ -1,10 +1,12 @@
 # Third-party source
 
-This repository distributes source patches, not the upstream projects or game
-data. Each patch remains subject to the license of the project it modifies.
-The applicable license texts and notices are bundled locally:
+This repository distributes the F-Zero PufferLib environment source and source
+patches, not complete upstream projects or game data. Each source file and
+patch remains subject to the license of the project it modifies. The applicable
+license texts and notices are bundled locally:
 
-- `patches/pufferlib-5.0.patch`: PufferLib,
+- `ocean/fzero/`, `config/fzero*.ini`, and
+  `patches/pufferlib-5.0.patch`: PufferLib,
   [MIT License](LICENSES/PufferLib/LICENSE).
 - `patches/g-diffuser.patch`: G-Diffuser,
   [MIT License](LICENSES/G-Diffuser/LICENSE) plus its

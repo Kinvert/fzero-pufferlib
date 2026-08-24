@@ -5,10 +5,11 @@ PufferLib 5.0, with an exact G-Diffuser CPU reference environment, a reduced
 batched CUDA simulator, deterministic graphical policy replay, and direct
 OpenGL video capture.
 
-This repository contains only source patches and documentation. It does not
-contain a ROM, extracted game assets, trained checkpoints, build products,
-logs, or videos. You must provide your own legally obtained North American
-revision-0 ROM.
+This repository contains the actual browsable PufferLib environment source,
+its configs and tests, plus exact patches for integrating it with the pinned
+upstream projects. It does not contain a ROM, extracted game assets, trained
+checkpoints, build products, logs, or videos. You must provide your own legally
+obtained North American revision-0 ROM.
 
 ## Current result
 
@@ -26,6 +27,25 @@ The 111,872-parameter policy trained for 819,200 decisions in 293.200 seconds
 evaluations in a mean 2,113.594 physics frames, with mean normalized score
 `0.946328` and 2.625 dash contacts per lap. Checkpoint weights are deliberately
 not included.
+
+## Browse the environment source
+
+The tested PufferLib environment is checked in directly at its normal paths:
+
+- [`ocean/fzero/fzero.h`](ocean/fzero/fzero.h): exact G-Diffuser adapter,
+  observations, actions, rewards, resets, and logging;
+- [`ocean/fzero/fzero.cu`](ocean/fzero/fzero.cu): PufferLib/CUDA environment
+  entry point and batched GPU backend;
+- [`ocean/fzero/fzero_gpu_core.cuh`](ocean/fzero/fzero_gpu_core.cuh): reduced
+  GPU simulation core;
+- [`ocean/fzero/tests/`](ocean/fzero/tests/): CPU adapter and GPU-core tests;
+- [`config/fzero.ini`](config/fzero.ini) and
+  [`config/fzero_gpu.ini`](config/fzero_gpu.ini): training configurations.
+
+These are ordinary source files, not generated views of the patch. This is not
+a complete PufferLib checkout: `patches/pufferlib-5.0.patch` remains the exact
+way to apply these files together with the required PufferLib build and runtime
+integration changes.
 
 ## Pinned upstream revisions
 
