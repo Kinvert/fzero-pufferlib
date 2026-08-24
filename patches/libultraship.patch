@@ -1,0 +1,20 @@
+diff --git a/cmake/dependencies/linux.cmake b/cmake/dependencies/linux.cmake
+index 02301f13..bf98095a 100644
+--- a/cmake/dependencies/linux.cmake
++++ b/cmake/dependencies/linux.cmake
+@@ -6,5 +6,14 @@ if (USE_OPENGLES)
+     target_link_libraries(ImGui PUBLIC ${OPENGL_GLESv2_LIBRARY})
+     add_compile_definitions(IMGUI_IMPL_OPENGL_ES3)
+ else()
+-    target_link_libraries(ImGui PUBLIC ${OPENGL_opengl_LIBRARY})
++    # Prefer GLVND's OpenGL target, but support hosts that expose only the
++    # legacy libGL target. OPENGL_opengl_LIBRARY is NOTFOUND on those systems
++    # even though FindOpenGL found a completely usable OpenGL::GL target.
++    if(TARGET OpenGL::OpenGL)
++        target_link_libraries(ImGui PUBLIC OpenGL::OpenGL)
++    elseif(TARGET OpenGL::GL)
++        target_link_libraries(ImGui PUBLIC OpenGL::GL)
++    else()
++        message(FATAL_ERROR "OpenGL was not found")
++    endif()
+ endif()

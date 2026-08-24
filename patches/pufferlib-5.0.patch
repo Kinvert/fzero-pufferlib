@@ -1,0 +1,3848 @@
+diff --git a/build.sh b/build.sh
+index 115d8f4b..8a497390 100755
+--- a/build.sh
++++ b/build.sh
+@@ -180,12 +180,44 @@ elif [ "$ENV" = "nethack" ]; then
+                -I./$NLE_DIR/build/_deps/deboost_context-src/include)
+     EXTRA_LDFLAGS+=(-L"$NETHACK_LIB_DIR" -lnethack
+                     -Xlinker -rpath -Xlinker "$NETHACK_LIB_DIR" -ldl)
++elif [ "$ENV" = "fzero" ]; then
++    if [ "$PLATFORM" != "Linux" ]; then
++        echo "Error: fzero requires Linux dlmopen" >&2
++        exit 1
++    fi
++    if [ "$USE_GPU_ENV" = "1" ]; then
++        case "${MODE:-native}" in
++            native|profile) ;;
++            *)
++                echo "Error: fzero --cu supports native/profile trainer builds only" >&2
++                exit 1
++                ;;
++        esac
++    else
++        case "${MODE:-native}" in
++            native|cpu) ;;
++            *)
++                echo "Error: the exact F-Zero CPU environment supports native/--cpu builds only" >&2
++                exit 1
++                ;;
++        esac
++    fi
++    SRC_DIR="ocean/$ENV"
++    # _GNU_SOURCE must be visible before system headers so link.h exposes
++    # LM_ID_NEWLM/dlmopen. The game DSO is resolved at runtime per namespace.
++    EXTRA_CFLAGS+=(-D_GNU_SOURCE)
++    EXTRA_LDFLAGS+=(-ldl)
+ elif [ -d "ocean/$ENV" ]; then
+     SRC_DIR="ocean/$ENV"
+ else
+     echo "Error: environment '$ENV' not found" && exit 1
+ fi
+ 
++CONFIG_ENV_NAME="$ENV"
++if [ "$ENV" = "fzero" ] && [ "$USE_GPU_ENV" = "1" ]; then
++    CONFIG_ENV_NAME="fzero_gpu"
++fi
++
+ case "$ENV" in
+     osrs_*)
+         python3 ocean/osrs/scripts/osrs_asset_manifest.py generate-c-header \
+@@ -232,7 +264,7 @@ if [ "$MODE" = "cpu" ]; then
+         -DPLATFORM_DESKTOP
+         -DPUFFERCPU_EVAL_MAIN
+         -DENV_HEADER=\"$ENV_HEADER\"
+-        -DPUFFER_ENV_NAME=\"$ENV\"
++        -DPUFFER_ENV_NAME=\"$CONFIG_ENV_NAME\"
+         "${EXTRA_CFLAGS[@]}"
+     )
+     echo "Compiling $ENV..."
+@@ -290,7 +322,7 @@ elif [ "$MODE" = "web" ]; then
+         -DPLATFORM_WEB -DGRAPHICS_API_OPENGL_ES3 \
+         -DPUFFERCPU_EVAL_MAIN \
+         -DENV_HEADER=\"$ENV_HEADER\" \
+-        -DPUFFER_ENV_NAME=\"$ENV\" \
++        -DPUFFER_ENV_NAME=\"$CONFIG_ENV_NAME\" \
+         --preload-file resources/shared@resources/shared \
+         "${PRELOAD_ENV[@]}" \
+         "${PRELOAD[@]}" \
+@@ -311,6 +343,7 @@ CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname "$(dirname "$(which nvcc)")")}}
+ # Needed when NCCL is provided by the nvidia-nccl-cu12 wheel in the active venv.
+ NCCL_IFLAG=""
+ NCCL_LFLAG=""
++NCCL_LIBFLAG="-lnccl"
+ for dir in /usr/include /usr/local/cuda/include; do
+     if [ -f "$dir/nccl.h" ]; then NCCL_IFLAG="-I$dir"; break; fi
+ done
+@@ -323,8 +356,23 @@ fi
+ if [ -z "$NCCL_LFLAG" ]; then
+     NCCL_LFLAG=$(python -c "import nvidia.nccl, os; print('-L' + os.path.join(nvidia.nccl.__path__[0], 'lib'))" 2>/dev/null || echo "")
+ fi
++if [[ "$NCCL_LFLAG" == -L* ]]; then
++    NCCL_LIBDIR=${NCCL_LFLAG#-L}
++    # NVIDIA's Python wheel may ship only the SONAME file. GNU ld accepts the
++    # exact filename, so a repo-local venv does not need a hand-made symlink.
++    if [ ! -e "$NCCL_LIBDIR/libnccl.so" ] && [ -e "$NCCL_LIBDIR/libnccl.so.2" ]; then
++        NCCL_LIBFLAG="-l:libnccl.so.2"
++    fi
++fi
+ 
+-export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
++if [ "$ENV" = "fzero" ]; then
++    # Keep this integration hermetic: compiling F-Zero must not populate or
++    # evict entries in a user's shared ccache.
++    export CCACHE_DIR="${CCACHE_DIR:-$(pwd)/build/ccache}"
++    export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-$(pwd)/build/ccache-tmp}"
++else
++    export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
++fi
+ export CCACHE_BASEDIR="$(pwd)"
+ export CCACHE_COMPILERCHECK=content
+ NVCC="ccache $CUDA_HOME/bin/nvcc"
+@@ -373,7 +421,7 @@ if [ "$MODE" = "native" ]; then
+         -I$CUDA_HOME/include -I$CUDA_HOME/include/cccl $NCCL_IFLAG -I$RAYLIB_NAME/include \
+ 	    "${ENV_COMPILE_FLAGS[@]}" \
+ 	    -DENV_NAME=$ENV \
+-	    -DPUFFER_ENV_NAME=\"$ENV\" \
++	    -DPUFFER_ENV_NAME=\"$CONFIG_ENV_NAME\" \
+ 	    -DPUFFERLIB_BUILD_MAIN \
+ 	    -Xcompiler=-DPLATFORM_DESKTOP \
+ 	    -Xcompiler=-fopenmp \
+@@ -385,7 +433,7 @@ if [ "$MODE" = "native" ]; then
+         "${LINK_ARCHIVES[@]}" \
+         -L$CUDA_HOME/lib64 $NCCL_LFLAG \
+         "${EXTRA_LDFLAGS[@]}" \
+-        -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand \
++        -lcudart $NCCL_LIBFLAG -lnvidia-ml -lcublas -lcusolver -lcurand \
+         -lm -lpthread $OMP_LIB "${STANDALONE_LDFLAGS[@]}" \
+         -o "$TRAIN_BIN"
+     echo "Built: ./$TRAIN_BIN"
+@@ -399,7 +447,7 @@ elif [ "$MODE" = "profile" ]; then
+         -I$CUDA_HOME/include -I$CUDA_HOME/include/cccl $NCCL_IFLAG -I$RAYLIB_NAME/include \
+         "${ENV_COMPILE_FLAGS[@]}" \
+         -DENV_NAME=$ENV \
+-	    -DPUFFER_ENV_NAME=\"$ENV\" \
++	    -DPUFFER_ENV_NAME=\"$CONFIG_ENV_NAME\" \
+         -Xcompiler=-DPLATFORM_DESKTOP \
+ 	    "${NVCC_NARROW[@]}" \
+ 	    "${EXTRA_CFLAGS[@]}" \
+@@ -408,7 +456,7 @@ elif [ "$MODE" = "profile" ]; then
+         tests/profile_kernels.cu \
+         "$RAYLIB_A" \
+         -L$CUDA_HOME/lib64 \
+-        -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand \
++        $NCCL_LIBFLAG -lnvidia-ml -lcublas -lcusolver -lcurand \
+         -lGL -lm -lpthread $OMP_LIB \
+         -o "$PROFILE_BIN"
+     echo "Built: ./$PROFILE_BIN"
+diff --git a/config/fzero.ini b/config/fzero.ini
+new file mode 100644
+index 00000000..cfce1018
+--- /dev/null
++++ b/config/fzero.ini
+@@ -0,0 +1,91 @@
++[base]
++env_name = fzero
++# Puffer/model sampling seed; independent from the reset stream under [env].
++seed = 73
++async = 0
++cudagraphs = -1
++checkpoint_interval = 100
++eval_episodes = 8
++
++[vec]
++# Each loaded F-Zero module owns one global game. Start with exactly one
++# environment, one rollout buffer, and one worker thread.
++total_agents = 1
++num_buffers = 1
++num_threads = 1
++num_policies = 1
++hist_policy_percent = 0
++
++[env]
++core_lib_path = ../G-Diffuser/build/rl-headless/port/libgdiffuser_rl.so
++rom_path = ../private/baserom.us.rev0.z64
++# Environment reset-sequence seed. Solo Mute City is currently invariant to
++# this seed for tested traces; task generalization needs explicit variants.
++seed = 73
++course_index = 0
++character = 0
++machine_skin = 0
++laps = 1
++# Action repeat is implemented inside gdx_rl_step; do not add Puffer frameskip.
++action_repeat = 4
++max_episode_frames = 9000
++stall_frames = 600
++stall_progress = 100.0
++engine_balance = 0.5
++cpu_oracle = 0
++# First curriculum: learn steering while masking pitch neutral, throttle on,
++# brake off, and boost off. Set to 0 to expose all five action heads.
++steering_curriculum = 1
++# Puffer clips learner rewards to [-1, 1]. Nonterminal progress and dash
++# shaping are scaled before rollout storage. Terminal outcomes bypass this
++# scale: a completed lap is in [0, 1], fatal failure is -1, and truncation is 0.
++reward_scale = 0.03125
++# A completed one-lap run scores clamp(target / successful_frames, 0, 1).
++# Set 0 for compatibility scoring where every completed lap receives 1.
++finish_time_target_frames = 2000
++# Optional shaping paid once when the exact core detects entry onto a dash pad.
++# Kept off by default; use 0.1 for the Mute City booster experiment.
++dash_hit_reward = 0
++
++[policy]
++hidden_size = 128
++num_layers = 2
++
++[train]
++gpus = 1
++# Puffer cosine-anneals the learning rate across this horizon. Keep the default
++# equal to the validated first phase; longer runs need an explicit schedule.
++total_timesteps = 65_536
++# The original 3e-4/replay-1 defaults did not measurably learn in 65,536
++# decisions. This recipe reached 81.25% finishes in its first 65,536-decision
++# phase; the README documents the lower-LR continuation that reached 90.23%.
++learning_rate = 0.003
++anneal_lr = 1
++replay_ratio = 4
++ent_coef = 0.0001
++gamma = 0.999
++gae_lambda = 0.95
++minibatch_size = 128
++horizon = 128
++
++[sweep]
++gpus = 1
++max_runs = 40
++
++# Keep F-Zero's one-runtime layout and coupled horizon/minibatch geometry fixed
++# until namespace scaling is benchmarked. Puffer's inherited sweep dimensions
++# would otherwise assert on invalid independent combinations.
++[sweep.vec.total_agents]
++enabled = 0
++
++[sweep.train.horizon]
++enabled = 0
++
++[sweep.train.minibatch_size]
++enabled = 0
++
++[sweep.train.total_timesteps]
++distribution = log_normal
++min = 65536
++max = 10000000
++scale = time
+diff --git a/config/fzero_gpu.ini b/config/fzero_gpu.ini
+new file mode 100644
+index 00000000..0ee0f610
+--- /dev/null
++++ b/config/fzero_gpu.ini
+@@ -0,0 +1,75 @@
++[base]
++env_name = fzero_gpu
++seed = 73
++async = 1
++cudagraphs = 1
++checkpoint_interval = 10
++eval_episodes = 256
++
++[vec]
++total_agents = 4096
++num_buffers = 1
++num_threads = 1
++num_policies = 1
++hist_policy_percent = 0
++
++[env]
++# The full port is loaded once to decode the user's private ROM and export an
++# in-memory course LUT plus canonical reset template. No extracted asset is
++# written to disk or copied into a checkpoint.
++core_lib_path = ../G-Diffuser/build/rl-headless/port/libgdiffuser_rl.so
++rom_path = ../private/baserom.us.rev0.z64
++seed = 73
++course_index = 0
++character = 0
++machine_skin = 0
++laps = 1
++action_repeat = 4
++max_episode_frames = 9000
++stall_frames = 600
++stall_progress = 100.0
++engine_balance = 0.5
++steering_curriculum = 1
++reward_scale = 0.03125
++# Successful terminal reward is clamp(target / physics_frames, 0, 1).
++# Fatal outcomes are -1; timeout and stall truncations are 0.
++finish_time_target_frames = 2000
++course_samples = 4096
++
++# Reduced-simulator v0 coefficients. These are deliberately configuration,
++# not claims of stock-physics parity; CPU trace fitting will replace/tune them.
++gpu_engine_target_speed = 60.0
++gpu_engine_acceleration = 0.25
++gpu_forward_drag = 0.997
++gpu_brake_drag = 0.987
++gpu_steering_rate = 0.032
++gpu_wall_margin = 1.0
++
++[policy]
++hidden_size = 128
++num_layers = 2
++
++[train]
++gpus = 1
++total_timesteps = 10_485_760
++learning_rate = 0.003
++anneal_lr = 1
++replay_ratio = 4
++ent_coef = 0.0001
++gamma = 0.999
++gae_lambda = 0.95
++minibatch_size = 32768
++horizon = 128
++
++[sweep]
++gpus = 1
++max_runs = 40
++
++[sweep.vec.total_agents]
++enabled = 0
++
++[sweep.train.horizon]
++enabled = 0
++
++[sweep.train.minibatch_size]
++enabled = 0
+diff --git a/ocean/breakout/breakout.cu b/ocean/breakout/breakout.cu
+index d533d248..e1185d0e 100644
+--- a/ocean/breakout/breakout.cu
++++ b/ocean/breakout/breakout.cu
+@@ -655,7 +655,9 @@ static Color BREAKOUT_BRICK_COLORS[6] = {
+ 
+ // Trainer create: returns device Env base (also stored in g_gpu).
+ Env* puf_vec_create(int n, Dict* env_kwargs,
+-        obs_t* observations, float* actions, float* rewards, float* terminals) {
++        obs_t* observations, float* actions, float* rewards, float* terminals,
++        unsigned char* action_mask) {
++    (void)action_mask;
+     gpu_breakout_host_fill_config(&g_gpu.cfg, env_kwargs);
+     cudaMemcpyToSymbol(d_bcfg, &g_gpu.cfg, sizeof(GpuBreakoutConfig));
+ 
+diff --git a/ocean/fzero/README.md b/ocean/fzero/README.md
+new file mode 100644
+index 00000000..92aed415
+--- /dev/null
++++ b/ocean/fzero/README.md
+@@ -0,0 +1,373 @@
++# F-Zero X
++
++This integration has two backends with one policy contract:
++
++- `fzero.h` is the exact headless G-Diffuser CPU oracle.
++- `fzero.cu` is a batched, device-resident reduced simulator for high-throughput
++  training. It loads the CPU oracle once at startup to decode the private ROM,
++  exports course geometry and a canonical reset template into memory, and then
++  performs reset, four-tick step, observation, reward, terminal, logging, and
++  autoreset on CUDA without per-step host copies.
++
++Neither backend opens a window, audio device, input device, or frame-rate
++limiter in headless mode. The ROM remains private and is loaded at runtime;
++never add it or an extracted course table to either repository.
++
++## Interface
++
++- Observation: 83 bounded `float32` values. The first 31 describe the racer,
++  controls, and episode state; six 8-value samples describe the track 250, 500,
++  1,000, 2,000, 4,000, and 8,000 distance units ahead.
++  Observation 24 says the car is on a dash pad now; observations 14 and 19
++  report the boost timer and any active boost. Observations 79-82 describe the
++  nearest upcoming dash pad: validity, wrapped forward distance, normalized
++  lateral/surface target, and normalized width.
++- Action: `MultiDiscrete([11, 5, 2, 2, 2])` for steer, pitch, throttle, brake,
++  and a one-tick boost tap. Steer uses neutral plus five symmetric magnitudes in
++  each direction. Eleven is deliberate: ten bins cannot retain both an exact
++  neutral and symmetric left/right choices. Category IDs are neutral-first:
++  steer `{0, -13, +13, -25, +25, -38, +38, -50, +50, -63, +63}` and pitch
++  `{0, -32, +32, -63, +63}`.
++- Default task: one-lap Mute City Time Attack, Blue Falcon, one agent, four
++  physics ticks per policy decision. The first curriculum exposes all 11 steer
++  bins while forcing pitch neutral, throttle on, brake off, and boost off.
++- The exact core retains distance progress divided by 1,000, +2 per completed
++  lap, +25 for a finish, and -25 for fatal failure as raw diagnostics.
++  Nonterminal learner rewards are divided by 32. The terminal learner reward
++  and logged `score`/`perf` are instead `clamp(2000 / lap_frames, 0, 1)` for a
++  finish, `-1` for fatal failure, and `0` for timeout/stall. Optional
++  `dash_hit_reward` shaping is paid once per dash-pad contact entry, detected
++  across all raw ticks inside an action repeat.
++
++The full ABI, observation schema, termination rules, and validation plan are in
++`../../../G-Diffuser/docs/PUFFERLIB_RL_SPEC.md`.
++
++## Build the headless core
++
++From `G-Diffuser`:
++
++```bash
++cmake -S . -B build/rl-headless -G Ninja \
++  -DGDX_RL_HEADLESS=ON -DGDX_EXPANSION_KIT=OFF \
++  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
++  -DGDX_RL_TEST_ROM="$PWD/../private/baserom.us.rev0.z64"
++cmake --build build/rl-headless --parallel
++ctest --test-dir build/rl-headless --output-on-failure
++```
++
++The default config expects the verified US rev0 ROM at
++`../private/baserom.us.rev0.z64`, relative to this PufferLib checkout. An
++explicit `FZEROX_ROM=/absolute/path/to/rom.z64` overrides that path.
++
++## Build PufferLib locally
++
++No driver or system install is needed when CUDA is already present. If NCCL is
++not available through the CUDA installation, put NVIDIA's NCCL wheel in a
++repo-local uv environment:
++
++```bash
++UV_CACHE_DIR="$PWD/.uv-cache" uv venv .venv
++UV_CACHE_DIR="$PWD/.uv-cache" uv pip install \
++  --python .venv/bin/python nvidia-nccl-cu12
++source .venv/bin/activate
++```
++
++Then build from the PufferLib checkout:
++
++```bash
++CUDA_HOME=/usr/local/cuda ./build.sh fzero build/fzero-train
++```
++
++Build the CUDA environment separately (set the local GPU architecture when
++`-arch=native` cannot inspect a sandboxed GPU):
++
++```bash
++CUDA_HOME=/usr/local/cuda NVCC_ARCH=sm_120 \
++  ./build.sh fzero build/fzero-gpu --cu
++```
++
++The CUDA binary selects `config/fzero_gpu.ini`; the CPU binary continues to use
++`config/fzero.ini`. On the current RTX 5060, an earlier observation-v1
++4,096-agent, horizon-128,
++replay-ratio-1 CUDA-graph run processed 5,242,880 policy decisions in 1.186 s,
++or 4.4M reported end-to-end SPS with the then-current 111,360-parameter policy.
++At action repeat four that is about 17.6M reduced-physics ticks/s. This clears
++the throughput target but is not yet a fidelity or CPU-transfer result. The
++83-input policy has 111,872 parameters; remeasure CUDA throughput before using
++the v1 number for capacity planning.
++
++The F-Zero build keeps ccache state under `build/`. When using wheel-provided
++NCCL, expose its repo-local library directory at runtime:
++
++```bash
++NCCL_LIB="$(.venv/bin/python -c \
++  'import nvidia.nccl, os; print(os.path.join(nvidia.nccl.__path__[0], "lib"))')"
++export LD_LIBRARY_PATH="$NCCL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
++```
++
++## Train and evaluate
++
++For a narrow Mute City lap-time demonstration, set
++`env.finish_time_target_frames` to a positive target. A successful terminal
++transition receives and logs
++`clamp(target_frames / episode_frames, 0, 1)`. Fatal outcomes receive `-1`, and
++time-limit/stall truncations receive `0`. This terminal outcome replaces the
++entire boundary-transition learner reward; scaled progress and dash shaping
++remain on nonterminal transitions. `score` and `perf` use the same outcome,
++while `episode_return` preserves the raw diagnostic return and `finish_rate`
++remains binary. A zero target gives every successful finish score 1.
++
++`dash_hit_reward` is expressed in the exact core's raw reward units and is
++then multiplied by `reward_scale` on nonterminal transitions. Thus `0.1` adds
++`0.003125` to the learner reward with the default `reward_scale=1/32`.
++
++### Current 83-input booster-observation run
++
++This fresh run trained the 111,872-parameter policy from random initialization
++with exact G-Diffuser CPU physics and the GPU PPO learner. It used the four
++upcoming-pad observation fields, normalized terminal pace score, and pad-entry
++shaping:
++
++```bash
++export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/nvidia/nccl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
++build/fzero-train train --headless \
++  --base.run_id=fzero-mc1-padobs-score-dash01-5min-20260824-a \
++  --base.checkpoint_dir=build/fzero-learning/checkpoints \
++  --base.log_dir=build/fzero-learning/logs \
++  --base.eval_episodes=0 \
++  --base.checkpoint_interval=256 \
++  --env.course_index=0 \
++  --env.laps=1 \
++  --env.action_repeat=4 \
++  --env.steering_curriculum=1 \
++  --env.finish_time_target_frames=2000 \
++  --env.dash_hit_reward=0.1 \
++  --train.total_timesteps=819200 \
++  --train.learning_rate=0.003 \
++  --train.replay_ratio=4 \
++  --train.ent_coef=0.0001
++```
++
++The run completed all 819,200 policy decisions in 293.200 seconds
++(4:53.200), or 2,794 decisions/s overall, and wrote 25 checkpoints. Screening
++the late checkpoints and then evaluating the shortlist on the same 64-episode
++exact stochastic stream selected step 786,432:
++
++```text
++build/fzero-learning/checkpoints/fzero/fzero-mc1-padobs-score-dash01-5min-20260824-a/0000000000786432.bin
++SHA-256 646e7f1116d280cf4a2c73efacb0ce9a428e306c7188da62d36f7e0ca1bac9d9
++```
++
++It finished 64/64 episodes in a mean 2,113.594 physics frames, logged mean
++normalized score/perf `0.946328`, and hit 2.625 dash pads per lap. Against the
++fastest historical 79-input checkpoint on the identical evaluation stream, it
++is 15.312 frames (0.2552 seconds) faster and raises pad contacts from 1.390625
++to 2.625 per lap. The final step-819,200 checkpoint also finished 64/64, at
++2,119.219 frames, score `0.943854`, and 2.531 contacts; checkpoint selection is
++therefore based on evaluated pace rather than merely taking the last weights.
++
++Reproduce the selected checkpoint evaluation with:
++
++```bash
++build/fzero-train eval \
++  build/fzero-learning/checkpoints/fzero/fzero-mc1-padobs-score-dash01-5min-20260824-a/0000000000786432.bin \
++  --headless --base.eval_episodes=64 \
++  --env.course_index=0 --env.laps=1 --env.action_repeat=4 \
++  --env.steering_curriculum=1 --env.finish_time_target_frames=2000 \
++  --env.dash_hit_reward=0.1
++```
++
++This run uses the exact CPU simulator with GPU policy inference/training. The
++reduced CUDA simulator consumes the same upcoming-pad descriptors and matches
++their observation values, but does not yet implement pad contact/boost physics
++or `dash_hit_reward`; do not treat this checkpoint as a CUDA-simulator result.
++
++### Historical 79-input baselines
++
++The commands and results below through the dash-contact experiment predate the
++four upcoming-pad observation fields. Their 79-input checkpoints are
++intentionally incompatible with the current 83-input policy and cannot be
++loaded without a first-layer migration.
++
++Run the then-validated steering-curriculum recipe for 65,536 decisions:
++
++```bash
++build/fzero-train train --headless \
++  --base.run_id=fzero-steer-65k \
++  --base.eval_episodes=0 \
++  --base.checkpoint_interval=64 \
++  --train.total_timesteps=65536
++```
++
++The config defaults to the empirically successful `learning_rate=0.003`,
++`replay_ratio=4`, and `ent_coef=0.0001`. A first run with these settings reached
++52/64 finishes in fresh-process evaluation. A second 65,536-decision phase,
++warm-started with `learning_rate=0.0015` and `ent_coef=0`, reached 231/256
++finishes (90.23%, mean raw score 100.56):
++
++```bash
++build/fzero-train train --headless \
++  --base.run_id=fzero-steer-cont65k \
++  --base.load_model_path=checkpoints/fzero/fzero-steer-65k/STEP.bin \
++  --base.eval_episodes=0 \
++  --base.checkpoint_interval=64 \
++  --train.total_timesteps=65536 \
++  --train.learning_rate=0.0015 \
++  --train.replay_ratio=4 \
++  --train.ent_coef=0
++```
++
++The first five-minute continuation used a 2,000-frame target and the validated
++checkpoint above:
++
++```bash
++build/fzero-train train --headless \
++  --base.run_id=fzero-mc1-laptime-5min-cont-20260824-a \
++  --base.checkpoint_dir=build/fzero-learning/checkpoints \
++  --base.log_dir=build/fzero-learning/logs \
++  --base.load_model_path=build/fzero-learning/checkpoints/fzero/fzero-steer-cont65k-lr15e4-r4-20260823-c/0000000000065536.bin \
++  --base.eval_episodes=0 \
++  --base.checkpoint_interval=256 \
++  --env.course_index=0 \
++  --env.laps=1 \
++  --env.action_repeat=4 \
++  --env.steering_curriculum=1 \
++  --env.finish_time_target_frames=2000 \
++  --train.total_timesteps=835584 \
++  --train.learning_rate=0.0015 \
++  --train.replay_ratio=4 \
++  --train.ent_coef=0
++```
++
++The process was stopped after the 655,360-decision checkpoint was safely
++written at five minutes. On the same fixed 64-episode exact evaluation stream,
++the source checkpoint finished 61/64 with 2,204.9 mean successful frames; the
++new checkpoint finished 64/64 with 2,128.9. The canonical sampler-seed-1 trace
++improved from 2,241 to 2,114 physics frames.
++
++The next 655,360-decision continuation keeps that pace target and adds `+0.1`
++raw per dash-pad acquisition. The source policy already averaged 1.390625 hits
++across the same 64 one-lap evaluations (89 contacts total out of 256 possible):
++
++```bash
++build/fzero-train train --headless \
++  --base.run_id=fzero-mc1-laptime-dash01-5min-cont-20260824-a \
++  --base.checkpoint_dir=build/fzero-learning/checkpoints \
++  --base.log_dir=build/fzero-learning/logs \
++  --base.load_model_path=build/fzero-learning/checkpoints/fzero/fzero-mc1-laptime-5min-cont-20260824-a/0000000000655360.bin \
++  --base.eval_episodes=0 \
++  --base.checkpoint_interval=256 \
++  --env.course_index=0 \
++  --env.laps=1 \
++  --env.action_repeat=4 \
++  --env.steering_curriculum=1 \
++  --env.finish_time_target_frames=2000 \
++  --env.dash_hit_reward=0.1 \
++  --train.total_timesteps=655360 \
++  --train.learning_rate=0.0015 \
++  --train.replay_ratio=4 \
++  --train.ent_coef=0
++```
++
++This run completed naturally in 242.268 seconds (4:02.268), or 2,705.1
++decisions/s overall. Screening every saved checkpoint selected step 131,072:
++
++```text
++build/fzero-learning/checkpoints/fzero/fzero-mc1-laptime-dash01-5min-cont-20260824-a/0000000000131072.bin
++SHA-256 fbde3087bb73b3225c21b32ef77b177ad98ea22892553a0456872b67e8e85e6d
++```
++
++On the same 64 exact stochastic evaluations, it retained 64/64 finishes and
++raised dash contacts from 89 to 117: 1.390625 to 1.828125 per lap, a 31.5%
++increase. Mean finish time moved from 2,128.906 to 2,138.656 physics frames
++(+9.75 frames, about +0.163 seconds). The final step reached exactly 2.0 hits
++per evaluated episode but regressed to 63/64 finishes and 2,148.0 mean finish
++frames, so it is not the selected checkpoint. Keep the source pace checkpoint
++for the fastest current demo; use step 131,072 when demonstrating that the
++explicit pad reward changes behavior.
++
++These results are for the one-lap steering-only curriculum. They establish that
++PPO learns from the public observation and binned action contract; they are not
++yet a three-lap, full-action, or multi-course result.
++
++The policy weights are restored before the first rollout; optimizer state and
++global step restart at zero. The next staged experiment is three-lap steering,
++with `--env.laps=3 --env.max_episode_frames=18000`, followed by a separately
++tuned full-five-head phase. That full-action schedule has not been validated
++yet, so it is deliberately not presented as a default command here. In native
++training, `--env.steering_curriculum=0` with no model
++samples an untrained stochastic policy; it is not a no-op baseline. The
++real-core adapter test below supplies the exact fixed all-zero baseline.
++
++A short end-to-end PPO check is:
++
++```bash
++build/fzero-train train --headless \
++  --base.run_id=fzero-smoke \
++  --base.eval_episodes=0 \
++  --base.checkpoint_interval=1 \
++  --train.total_timesteps=1024
++```
++
++Reload the final checkpoint with:
++
++```bash
++build/fzero-train eval checkpoints/fzero/RUN_ID/STEP.bin \
++  --headless --base.eval_episodes=256
++```
++
++Export one exact CPU-oracle episode for graphical G-Diffuser playback with:
++
++```bash
++ocean/fzero/export_render_trace.sh \
++  checkpoints/fzero/RUN_ID/STEP.bin \
++  build/fzero-render-eval-input.txt
++```
++
++The runner pins the canonical seed-73, one-lap Mute City steering task and an
++explicit policy sampler seed of 1. It writes post-curriculum actions in
++`GDX_INPUT_SCRIPT` format: each decision holds its raw pad for four game ticks,
++except boost, which taps B only on the first tick. The footer records the exact
++terminal score, reason, frame, distance, and semantic hash, then waits for the
++finish display, requests a screenshot, and quits cleanly. The output is
++published atomically only after the episode reaches a boundary.
++
++Evaluation samples categorical actions. It is reproducible with fixed sampler
++and environment seeds, but is not greedy/argmax evaluation. `base.seed` controls
++model initialization and sampling while `env.seed` controls reset sequencing.
++Tested solo Mute City resets are physics-invariant across environment seeds, so
++different reset seeds are not evidence of task generalization.
++
++Focused adapter tests, including worker-thread handoff, terminal autoreset,
++runtime course export, deterministic reduced-core replay, initial-observation
++geometry agreement, a scripted reduced-core lap, and the exact CPU no-op
++baseline, run with:
++
++```bash
++bash ocean/fzero/tests/run_all.sh
++FZERO_TEST_REAL_CORE=1 bash ocean/fzero/tests/run_all.sh
++```
++
++Episode logs report normalized `score`/`perf`, raw episode returns, actual
++learner returns, successful finish frames, dash hits, and mean-per-episode
++action-category fractions. These are the first diagnostics for detecting
++steering collapse before unlocking the button heads.
++
++## CUDA fidelity status
++
++The CUDA backend is explicitly a reduced simulator v0, not a claim that the
++7,000-line stock racer update has already been reproduced. Its first reset
++observation agrees with the exact spline oracle to a measured maximum absolute
++error of 0.001136 over the original 79 fields; the four dash descriptors agree
++exactly in the current full-lap host parity test. Its deterministic scripted pilot
++finishes the first Mute City lap in 2,412 physics frames versus 2,339 for the
++CPU public-observation oracle. Those are geometry and task-shape checks, not
++open-loop dynamics parity.
++
++The next release gates are fixed-action CPU/CUDA state traces, policy-in-loop
++paired outcomes, and a GPU-trained checkpoint that reaches the existing 90%
++finish gate in fresh exact CPU-oracle episodes. Until those pass, GPU-only
++returns must not be presented as F-Zero policy performance. Keep the exact
++83-value observation, `MultiDiscrete([11,5,2,2,2])` action, reward, termination,
++and action-repeat contracts stable while the solo racer/contact physics is
++incrementally ported or fitted.
+diff --git a/ocean/fzero/export_render_trace.sh b/ocean/fzero/export_render_trace.sh
+new file mode 100755
+index 00000000..356999b1
+--- /dev/null
++++ b/ocean/fzero/export_render_trace.sh
+@@ -0,0 +1,49 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++cd "$(dirname "$0")/../.."
++
++if [[ $# -lt 2 || $# -gt 3 ]]; then
++    echo "usage: $0 CHECKPOINT.bin OUTPUT_SCRIPT.txt [CPU_EVAL_BINARY]" >&2
++    exit 2
++fi
++
++checkpoint=$1
++output_script=$2
++cpu_eval=${3:-build/fzero-cpu}
++core_lib=${FZERO_CORE_LIB:-../G-Diffuser/build/rl-headless/port/libgdiffuser_rl.so}
++
++if [[ ! -f "$checkpoint" ]]; then
++    echo "error: checkpoint not found: $checkpoint" >&2
++    exit 2
++fi
++
++if [[ ! -x "$cpu_eval" ]]; then
++    ./build.sh fzero "$cpu_eval" --cpu
++fi
++
++# This pins the exact canonical one-lap task that produced the validated CPU
++# policy result. Policy sampling uses the standalone evaluator's explicit seed
++# 1 stream; environment/race initialization uses seed 73.
++"$cpu_eval" fzero "$checkpoint" \
++    --headless \
++    --gdx-input-script="$output_script" \
++    --gdx-sampler-seed=1 \
++    --base.seed=73 \
++    --base.eval_episodes=1 \
++    --env.core_lib_path="$core_lib" \
++    --env.seed=73 \
++    --env.course_index=0 \
++    --env.character=0 \
++    --env.machine_skin=0 \
++    --env.laps=1 \
++    --env.action_repeat=4 \
++    --env.max_episode_frames=9000 \
++    --env.stall_frames=600 \
++    --env.stall_progress=100 \
++    --env.engine_balance=0.5 \
++    --env.cpu_oracle=0 \
++    --env.steering_curriculum=1 \
++    --env.reward_scale=0.03125 \
++    --policy.hidden_size=128 \
++    --policy.num_layers=2
+diff --git a/ocean/fzero/fzero.cu b/ocean/fzero/fzero.cu
+new file mode 100644
+index 00000000..5bc2a574
+--- /dev/null
++++ b/ocean/fzero/fzero.cu
+@@ -0,0 +1,568 @@
++#ifndef PUFFER_FZERO_GPU_CU
++#define PUFFER_FZERO_GPU_CU
++
++#define PUF_BACKEND PUF_GPU
++
++#include <cuda_runtime.h>
++#include <dlfcn.h>
++#include <float.h>
++#include <link.h>
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++typedef float obs_t;
++#include "pufferenv.h"
++
++#include "fzero_gpu_core.cuh"
++
++#define OBS_SIZE GDX_RL_OBSERVATION_SIZE
++#define NUM_ATNS GDX_RL_ACTION_SIZE
++#define ACT_SIZES {11, 5, 2, 2, 2}
++
++enum {
++    FZERO_GPU_ACTION_MASK_SIZE = 22,
++    FZERO_GPU_BLOCK_SIZE = 256,
++};
++
++struct Log {
++    float perf;
++    float score;
++    float episode_return;
++    float learner_return;
++    float episode_length;
++    float episode_frames;
++    float race_distance;
++    float terminal_speed;
++    float terminal_energy;
++    float terminal_lap;
++    float finish_rate;
++    float terminated_rate;
++    float truncated_rate;
++    float spinning_out_rate;
++    float falling_rate;
++    float crashed_rate;
++    float retired_rate;
++    float time_limit_rate;
++    float stalled_rate;
++    float steer_fraction[GDX_RL_STEER_BINS];
++    float pitch_fraction[GDX_RL_PITCH_BINS];
++    float throttle_on_fraction;
++    float brake_on_fraction;
++    float boost_on_fraction;
++    float n;
++};
++
++struct Env {
++    Log log;
++    Agent agents[1];
++    int num_agents;
++    int tag;
++    int boundary_reached;
++    unsigned int rng;
++    FZeroGpuState state;
++};
++
++typedef struct FZeroGpuOracleApi {
++    void* handle;
++    uint32_t (*abi_version)(void);
++    void (*default_config)(GdxRlConfig*);
++    int (*init)(const char*, const GdxRlConfig*);
++    int (*reset)(uint32_t, float*);
++    int (*export_course)(uint32_t, GdxRlCourseSample*, GdxRlCourseMetadata*);
++    int (*export_dash_pads)(uint32_t, GdxRlDashPad*, uint32_t*);
++    int (*export_reference_state)(GdxRlReferenceState*);
++    const char* (*last_error)(void);
++} FZeroGpuOracleApi;
++
++static struct {
++    Env* envs;
++    int n;
++    obs_t* observations;
++    float* actions;
++    float* rewards;
++    float* terminals;
++    unsigned char* action_mask;
++    GdxRlCourseSample* course;
++    GdxRlCourseSample* host_course;
++    GdxRlDashPad host_dash_pads[GDX_RL_MAX_DASH_PADS];
++    GdxRlCourseMetadata course_metadata;
++    GdxRlReferenceState reference;
++    FZeroGpuConfig config;
++    FZeroGpuOracleApi oracle;
++    cudaStream_t stream;
++} g_fzero_gpu;
++
++__constant__ FZeroGpuConfig d_fzero_gpu_config;
++__constant__ GdxRlDashPad d_fzero_gpu_dash_pads[GDX_RL_MAX_DASH_PADS];
++
++static void fzero_gpu_fatal(const char* operation, const char* detail) {
++    fprintf(stderr, "fzero-gpu: %s: %s\n", operation,
++        detail != NULL && detail[0] != '\0' ? detail : "unknown error");
++    fflush(stderr);
++    exit(EXIT_FAILURE);
++}
++
++static void fzero_gpu_cuda_check(cudaError_t error, const char* operation) {
++    if (error != cudaSuccess) {
++        fzero_gpu_fatal(operation, cudaGetErrorString(error));
++    }
++}
++
++static void fzero_gpu_load_symbol(
++        const char* name, void* destination, size_t destination_size) {
++    dlerror();
++    void* symbol = dlsym(g_fzero_gpu.oracle.handle, name);
++    const char* error = dlerror();
++    if (error != NULL || symbol == NULL) {
++        fzero_gpu_fatal(name, error != NULL ? error : "symbol resolved to null");
++    }
++    if (destination_size != sizeof(symbol)) {
++        fzero_gpu_fatal(name, "unsupported function pointer representation");
++    }
++    memcpy(destination, &symbol, sizeof(symbol));
++}
++
++static int32_t fzero_gpu_config_i32(Dict* kwargs, const char* key) {
++    double value = dict_get(kwargs, key);
++    if (!isfinite(value) || value != trunc(value) ||
++            value < (double)INT32_MIN || value > (double)INT32_MAX) {
++        fprintf(stderr, "fzero-gpu: [env].%s must be an int32, got %.17g\n", key, value);
++        exit(EXIT_FAILURE);
++    }
++    return (int32_t)value;
++}
++
++static uint32_t fzero_gpu_config_u32(Dict* kwargs, const char* key) {
++    double value = dict_get(kwargs, key);
++    if (!isfinite(value) || value != trunc(value) ||
++            value < 0.0 || value > (double)UINT32_MAX) {
++        fprintf(stderr, "fzero-gpu: [env].%s must be a uint32, got %.17g\n", key, value);
++        exit(EXIT_FAILURE);
++    }
++    return (uint32_t)value;
++}
++
++static float fzero_gpu_config_positive(Dict* kwargs, const char* key) {
++    double value = dict_get(kwargs, key);
++    if (!isfinite(value) || value <= 0.0 || value > (double)FLT_MAX) {
++        fprintf(stderr, "fzero-gpu: [env].%s must be finite and positive, got %.17g\n", key, value);
++        exit(EXIT_FAILURE);
++    }
++    return (float)value;
++}
++
++static float fzero_gpu_config_nonnegative(Dict* kwargs, const char* key) {
++    double value = dict_get(kwargs, key);
++    if (!isfinite(value) || value < 0.0 || value > (double)FLT_MAX) {
++        fprintf(stderr,
++            "fzero-gpu: [env].%s must be finite and non-negative, got %.17g\n",
++            key, value);
++        exit(EXIT_FAILURE);
++    }
++    return (float)value;
++}
++
++static void fzero_gpu_load_oracle(Dict* kwargs) {
++    const char* library_path = dict_get_str(kwargs, "core_lib_path");
++    const char* rom_path = dict_get_str(kwargs, "rom_path");
++    const char* rom_override = getenv("FZEROX_ROM");
++    if (rom_override != NULL && rom_override[0] != '\0') {
++        rom_path = rom_override;
++    }
++
++    g_fzero_gpu.oracle.handle =
++        dlmopen(LM_ID_NEWLM, library_path, RTLD_NOW | RTLD_LOCAL);
++    if (g_fzero_gpu.oracle.handle == NULL) {
++        fzero_gpu_fatal("dlmopen", dlerror());
++    }
++    fzero_gpu_load_symbol("gdx_rl_abi_version", &g_fzero_gpu.oracle.abi_version,
++        sizeof(g_fzero_gpu.oracle.abi_version));
++    fzero_gpu_load_symbol("gdx_rl_default_config", &g_fzero_gpu.oracle.default_config,
++        sizeof(g_fzero_gpu.oracle.default_config));
++    fzero_gpu_load_symbol("gdx_rl_init", &g_fzero_gpu.oracle.init,
++        sizeof(g_fzero_gpu.oracle.init));
++    fzero_gpu_load_symbol("gdx_rl_reset", &g_fzero_gpu.oracle.reset,
++        sizeof(g_fzero_gpu.oracle.reset));
++    fzero_gpu_load_symbol("gdx_rl_export_course", &g_fzero_gpu.oracle.export_course,
++        sizeof(g_fzero_gpu.oracle.export_course));
++    fzero_gpu_load_symbol("gdx_rl_export_dash_pads",
++        &g_fzero_gpu.oracle.export_dash_pads,
++        sizeof(g_fzero_gpu.oracle.export_dash_pads));
++    fzero_gpu_load_symbol("gdx_rl_export_reference_state",
++        &g_fzero_gpu.oracle.export_reference_state,
++        sizeof(g_fzero_gpu.oracle.export_reference_state));
++    fzero_gpu_load_symbol("gdx_rl_last_error", &g_fzero_gpu.oracle.last_error,
++        sizeof(g_fzero_gpu.oracle.last_error));
++
++    if (g_fzero_gpu.oracle.abi_version() != GDX_RL_ABI_VERSION) {
++        fzero_gpu_fatal("oracle ABI", "G-Diffuser and PufferLib headers do not match");
++    }
++
++    GdxRlConfig oracle_config;
++    g_fzero_gpu.oracle.default_config(&oracle_config);
++    oracle_config.course_index = fzero_gpu_config_i32(kwargs, "course_index");
++    oracle_config.character = fzero_gpu_config_i32(kwargs, "character");
++    oracle_config.machine_skin = fzero_gpu_config_i32(kwargs, "machine_skin");
++    oracle_config.laps = fzero_gpu_config_i32(kwargs, "laps");
++    oracle_config.action_repeat = fzero_gpu_config_i32(kwargs, "action_repeat");
++    oracle_config.max_episode_frames = fzero_gpu_config_i32(kwargs, "max_episode_frames");
++    oracle_config.stall_frames = fzero_gpu_config_i32(kwargs, "stall_frames");
++    oracle_config.stall_progress = (float)dict_get(kwargs, "stall_progress");
++    oracle_config.engine_balance = (float)dict_get(kwargs, "engine_balance");
++    oracle_config.cpu_oracle = 0;
++    if (g_fzero_gpu.oracle.init(rom_path, &oracle_config) != 0) {
++        fzero_gpu_fatal("gdx_rl_init", g_fzero_gpu.oracle.last_error());
++    }
++
++    uint32_t seed = fzero_gpu_config_u32(kwargs, "seed");
++    float initial_observation[GDX_RL_OBSERVATION_SIZE];
++    if (g_fzero_gpu.oracle.reset(seed, initial_observation) != 0) {
++        fzero_gpu_fatal("gdx_rl_reset", g_fzero_gpu.oracle.last_error());
++    }
++
++    int32_t sample_count = fzero_gpu_config_i32(kwargs, "course_samples");
++    if (sample_count < 256 || sample_count > 65536) {
++        fzero_gpu_fatal("configuration", "course_samples must be in [256, 65536]");
++    }
++    g_fzero_gpu.host_course = (GdxRlCourseSample*)calloc(
++        (size_t)sample_count, sizeof(GdxRlCourseSample));
++    if (g_fzero_gpu.host_course == NULL) {
++        fzero_gpu_fatal("course allocation", "out of host memory");
++    }
++    if (g_fzero_gpu.oracle.export_course((uint32_t)sample_count,
++            g_fzero_gpu.host_course, &g_fzero_gpu.course_metadata) != 0) {
++        fzero_gpu_fatal("gdx_rl_export_course", g_fzero_gpu.oracle.last_error());
++    }
++    if (g_fzero_gpu.course_metadata.version != GDX_RL_COURSE_EXPORT_VERSION ||
++            g_fzero_gpu.course_metadata.sample_count != (uint32_t)sample_count ||
++            g_fzero_gpu.course_metadata.dash_pad_count > GDX_RL_MAX_DASH_PADS ||
++            !(g_fzero_gpu.course_metadata.length > 0.0f) ||
++            !(g_fzero_gpu.course_metadata.sample_spacing > 0.0f)) {
++        fzero_gpu_fatal("gdx_rl_export_course", "invalid course export metadata");
++    }
++    uint32_t dash_pad_count = 0;
++    if (g_fzero_gpu.oracle.export_dash_pads(GDX_RL_MAX_DASH_PADS,
++            g_fzero_gpu.host_dash_pads, &dash_pad_count) != 0) {
++        fzero_gpu_fatal("gdx_rl_export_dash_pads", g_fzero_gpu.oracle.last_error());
++    }
++    if (dash_pad_count != g_fzero_gpu.course_metadata.dash_pad_count ||
++            dash_pad_count > GDX_RL_MAX_DASH_PADS) {
++        fzero_gpu_fatal("gdx_rl_export_dash_pads",
++            "dash-pad count disagrees with course metadata");
++    }
++    for (uint32_t i = 0; i < dash_pad_count; ++i) {
++        const GdxRlDashPad* pad = &g_fzero_gpu.host_dash_pads[i];
++        if (!isfinite(pad->entry_distance) || pad->entry_distance < 0.0f ||
++                pad->entry_distance >= g_fzero_gpu.course_metadata.length ||
++                !isfinite(pad->target) || pad->target < -1.0f || pad->target > 1.0f ||
++                !isfinite(pad->width) || pad->width < 0.0f || pad->width > 1.0f ||
++                pad->segment_index > (uint32_t)INT32_MAX ||
++                pad->segment_index >= g_fzero_gpu.course_metadata.segment_count) {
++            fzero_gpu_fatal("gdx_rl_export_dash_pads", "invalid dash-pad descriptor");
++        }
++    }
++    if (g_fzero_gpu.oracle.export_reference_state(&g_fzero_gpu.reference) != 0) {
++        fzero_gpu_fatal("gdx_rl_export_reference_state", g_fzero_gpu.oracle.last_error());
++    }
++
++    FZeroGpuConfig* config = &g_fzero_gpu.config;
++    memset(config, 0, sizeof(*config));
++    config->sample_count = sample_count;
++    config->dash_pad_count = (int32_t)dash_pad_count;
++    config->laps = oracle_config.laps;
++    config->action_repeat = oracle_config.action_repeat;
++    config->max_episode_frames = oracle_config.max_episode_frames;
++    config->stall_frames = oracle_config.stall_frames;
++    config->steering_curriculum = fzero_gpu_config_i32(kwargs, "steering_curriculum");
++    if (config->steering_curriculum != 0 && config->steering_curriculum != 1) {
++        fzero_gpu_fatal("configuration", "steering_curriculum must be 0 or 1");
++    }
++    config->course_length = g_fzero_gpu.course_metadata.length;
++    config->sample_spacing = g_fzero_gpu.course_metadata.sample_spacing;
++    config->stall_progress = oracle_config.stall_progress;
++    config->reward_scale = fzero_gpu_config_positive(kwargs, "reward_scale");
++    if (config->reward_scale > 0.03125f) {
++        fzero_gpu_fatal("configuration", "reward_scale must be at most 1/32");
++    }
++    config->finish_time_target_frames =
++        fzero_gpu_config_nonnegative(kwargs, "finish_time_target_frames");
++    config->engine_target_speed =
++        fzero_gpu_config_positive(kwargs, "gpu_engine_target_speed");
++    config->engine_acceleration =
++        fzero_gpu_config_positive(kwargs, "gpu_engine_acceleration");
++    config->forward_drag = fzero_gpu_config_positive(kwargs, "gpu_forward_drag");
++    config->brake_drag = fzero_gpu_config_positive(kwargs, "gpu_brake_drag");
++    config->steering_rate = fzero_gpu_config_positive(kwargs, "gpu_steering_rate");
++    config->wall_margin = fzero_gpu_config_positive(kwargs, "gpu_wall_margin");
++    if (config->forward_drag > 1.0f || config->brake_drag > 1.0f) {
++        fzero_gpu_fatal("configuration", "GPU drag factors must be in (0, 1]");
++    }
++    config->initial_race_distance = g_fzero_gpu.reference.race_distance;
++    config->initial_lap_distance = g_fzero_gpu.reference.lap_distance;
++    config->initial_lateral = g_fzero_gpu.reference.lateral;
++    config->initial_vertical = g_fzero_gpu.reference.vertical;
++    config->initial_speed = g_fzero_gpu.reference.speed;
++    config->initial_energy = g_fzero_gpu.reference.energy;
++    config->max_energy = g_fzero_gpu.reference.max_energy;
++    config->seed = seed;
++
++    fprintf(stderr,
++        "fzero-gpu: reduced simulator v0, course=%d samples=%d dash_pads=%u length=%.3f "
++        "initial_distance=%.3f\n",
++        oracle_config.course_index, sample_count, dash_pad_count, config->course_length,
++        config->initial_race_distance);
++}
++
++struct FZeroGpuObservationStore {
++    obs_t* values;
++
++    __device__ __forceinline__ void operator()(int index, float value) const {
++        values[index] = value;
++    }
++};
++
++__device__ static void fzero_gpu_add_log(
++        Env* env, const FZeroGpuStepResult* result) {
++    const FZeroGpuState* state = &env->state;
++    const float inv_decisions = state->episode_decisions > 0
++        ? 1.0f / (float)state->episode_decisions : 0.0f;
++    const float terminal_outcome = result->learner_reward;
++    env->log.perf += terminal_outcome;
++    env->log.score += terminal_outcome;
++    env->log.episode_return += state->episode_return;
++    env->log.learner_return += state->learner_return;
++    env->log.episode_length += (float)state->episode_decisions;
++    env->log.episode_frames += (float)state->episode_frame;
++    env->log.race_distance += state->race_distance;
++    env->log.terminal_speed += state->speed;
++    env->log.terminal_energy += d_fzero_gpu_config.max_energy > 0.0f
++        ? state->energy / d_fzero_gpu_config.max_energy : 0.0f;
++    env->log.terminal_lap += (float)state->laps_completed;
++    env->log.finish_rate += result->reason == FZERO_GPU_FINISHED ? 1.0f : 0.0f;
++    env->log.terminated_rate += result->terminated ? 1.0f : 0.0f;
++    env->log.truncated_rate += result->truncated ? 1.0f : 0.0f;
++    env->log.spinning_out_rate += result->reason == FZERO_GPU_SPINNING_OUT ? 1.0f : 0.0f;
++    env->log.falling_rate += result->reason == FZERO_GPU_FALLING ? 1.0f : 0.0f;
++    env->log.crashed_rate += result->reason == FZERO_GPU_CRASHED ? 1.0f : 0.0f;
++    env->log.retired_rate += result->reason == FZERO_GPU_RETIRED ? 1.0f : 0.0f;
++    env->log.time_limit_rate += result->reason == FZERO_GPU_TIME_LIMIT ? 1.0f : 0.0f;
++    env->log.stalled_rate += result->reason == FZERO_GPU_STALLED ? 1.0f : 0.0f;
++    for (int i = 0; i < GDX_RL_STEER_BINS; ++i) {
++        env->log.steer_fraction[i] += (float)state->steer_counts[i] * inv_decisions;
++    }
++    for (int i = 0; i < GDX_RL_PITCH_BINS; ++i) {
++        env->log.pitch_fraction[i] += (float)state->pitch_counts[i] * inv_decisions;
++    }
++    env->log.throttle_on_fraction += (float)state->throttle_on_count * inv_decisions;
++    env->log.brake_on_fraction += (float)state->brake_on_count * inv_decisions;
++    env->log.boost_on_fraction += (float)state->boost_on_count * inv_decisions;
++    env->log.n += 1.0f;
++}
++
++__global__ static void fzero_gpu_reset_kernel(Env* envs, int n,
++        const GdxRlCourseSample* course, obs_t* observations,
++        float* rewards, float* terminals) {
++    int env_index = blockIdx.x * blockDim.x + threadIdx.x;
++    if (env_index >= n) {
++        return;
++    }
++    Env* env = &envs[env_index];
++    fzero_gpu_reset_state(&env->state, &d_fzero_gpu_config, (uint32_t)env_index);
++    FZeroGpuObservationStore store = {
++        observations + (size_t)env_index * GDX_RL_OBSERVATION_SIZE,
++    };
++    fzero_gpu_observe(&env->state, &d_fzero_gpu_config, course,
++        d_fzero_gpu_dash_pads, store);
++    rewards[env_index] = 0.0f;
++    terminals[env_index] = 0.0f;
++}
++
++__global__ static void fzero_gpu_step_kernel(Env* envs, int n,
++        const GdxRlCourseSample* course, obs_t* observations,
++        const float* actions, float* rewards, float* terminals) {
++    int env_index = blockIdx.x * blockDim.x + threadIdx.x;
++    if (env_index >= n) {
++        return;
++    }
++    Env* env = &envs[env_index];
++    int32_t action[GDX_RL_ACTION_SIZE];
++    const int32_t action_sizes[GDX_RL_ACTION_SIZE] = {11, 5, 2, 2, 2};
++    for (int head = 0; head < GDX_RL_ACTION_SIZE; ++head) {
++        float raw = actions[(size_t)env_index * GDX_RL_ACTION_SIZE + head];
++        int32_t category = (int32_t)raw;
++        action[head] = isfinite(raw) && raw == (float)category &&
++            category >= 0 && category < action_sizes[head] ? category : 0;
++    }
++
++    FZeroGpuStepResult result =
++        fzero_gpu_step_state(&env->state, &d_fzero_gpu_config, course, action);
++    float learner_reward = result.learner_reward;
++    const bool done = result.terminated || result.truncated;
++    if (done) {
++        fzero_gpu_add_log(env, &result);
++        fzero_gpu_reset_state(&env->state, &d_fzero_gpu_config, (uint32_t)env_index);
++    }
++    FZeroGpuObservationStore store = {
++        observations + (size_t)env_index * GDX_RL_OBSERVATION_SIZE,
++    };
++    fzero_gpu_observe(&env->state, &d_fzero_gpu_config, course,
++        d_fzero_gpu_dash_pads, store);
++    rewards[env_index] = learner_reward;
++    terminals[env_index] = done ? 1.0f : 0.0f;
++}
++
++Env* puf_vec_create(int n, Dict* env_kwargs,
++        obs_t* observations, float* actions, float* rewards, float* terminals,
++        unsigned char* action_mask) {
++    if (n <= 0) {
++        fzero_gpu_fatal("puf_vec_create", "vector size must be positive");
++    }
++    fzero_gpu_load_oracle(env_kwargs);
++    g_fzero_gpu.n = n;
++    g_fzero_gpu.observations = observations;
++    g_fzero_gpu.actions = actions;
++    g_fzero_gpu.rewards = rewards;
++    g_fzero_gpu.terminals = terminals;
++    g_fzero_gpu.action_mask = action_mask;
++    g_fzero_gpu.stream = 0;
++
++    fzero_gpu_cuda_check(cudaMalloc((void**)&g_fzero_gpu.envs,
++        (size_t)n * sizeof(Env)), "cudaMalloc environments");
++    fzero_gpu_cuda_check(cudaMemset(g_fzero_gpu.envs, 0,
++        (size_t)n * sizeof(Env)), "cudaMemset environments");
++    fzero_gpu_cuda_check(cudaMalloc((void**)&g_fzero_gpu.course,
++        (size_t)g_fzero_gpu.config.sample_count * sizeof(GdxRlCourseSample)),
++        "cudaMalloc course");
++    fzero_gpu_cuda_check(cudaMemcpy(g_fzero_gpu.course, g_fzero_gpu.host_course,
++        (size_t)g_fzero_gpu.config.sample_count * sizeof(GdxRlCourseSample),
++        cudaMemcpyHostToDevice), "cudaMemcpy course");
++    fzero_gpu_cuda_check(cudaMemcpyToSymbol(d_fzero_gpu_config,
++        &g_fzero_gpu.config, sizeof(g_fzero_gpu.config)), "cudaMemcpyToSymbol config");
++    fzero_gpu_cuda_check(cudaMemcpyToSymbol(d_fzero_gpu_dash_pads,
++        g_fzero_gpu.host_dash_pads, sizeof(g_fzero_gpu.host_dash_pads)),
++        "cudaMemcpyToSymbol dash pads");
++
++    size_t mask_bytes = (size_t)n * FZERO_GPU_ACTION_MASK_SIZE;
++    unsigned char* host_mask = (unsigned char*)malloc(mask_bytes);
++    if (host_mask == NULL) {
++        fzero_gpu_fatal("action mask allocation", "out of host memory");
++    }
++    memset(host_mask, g_fzero_gpu.config.steering_curriculum ? 0 : 1, mask_bytes);
++    if (g_fzero_gpu.config.steering_curriculum) {
++        for (int env_index = 0; env_index < n; ++env_index) {
++            unsigned char* mask = host_mask + (size_t)env_index * FZERO_GPU_ACTION_MASK_SIZE;
++            memset(mask, 1, GDX_RL_STEER_BINS);
++            mask[11] = 1;
++            mask[17] = 1;
++            mask[18] = 1;
++            mask[20] = 1;
++        }
++    }
++    fzero_gpu_cuda_check(cudaMemcpy(action_mask, host_mask, mask_bytes,
++        cudaMemcpyHostToDevice), "cudaMemcpy action masks");
++    free(host_mask);
++    return g_fzero_gpu.envs;
++}
++
++void puf_bind_stream(cudaStream_t stream) {
++    g_fzero_gpu.stream = stream;
++}
++
++void puf_init(Env*, Dict*) {
++}
++
++void puf_reset(Env*) {
++    int blocks = (g_fzero_gpu.n + FZERO_GPU_BLOCK_SIZE - 1) / FZERO_GPU_BLOCK_SIZE;
++    fzero_gpu_reset_kernel<<<blocks, FZERO_GPU_BLOCK_SIZE, 0, g_fzero_gpu.stream>>>(
++        g_fzero_gpu.envs, g_fzero_gpu.n, g_fzero_gpu.course,
++        g_fzero_gpu.observations, g_fzero_gpu.rewards, g_fzero_gpu.terminals);
++    fzero_gpu_cuda_check(cudaGetLastError(), "launch reset kernel");
++}
++
++void puf_step(Env*) {
++    int blocks = (g_fzero_gpu.n + FZERO_GPU_BLOCK_SIZE - 1) / FZERO_GPU_BLOCK_SIZE;
++    fzero_gpu_step_kernel<<<blocks, FZERO_GPU_BLOCK_SIZE, 0, g_fzero_gpu.stream>>>(
++        g_fzero_gpu.envs, g_fzero_gpu.n, g_fzero_gpu.course,
++        g_fzero_gpu.observations, g_fzero_gpu.actions,
++        g_fzero_gpu.rewards, g_fzero_gpu.terminals);
++    fzero_gpu_cuda_check(cudaGetLastError(), "launch step kernel");
++}
++
++void puf_render(Env*) {
++    if (g_fzero_gpu.stream != 0) {
++        fzero_gpu_cuda_check(cudaStreamSynchronize(g_fzero_gpu.stream),
++            "synchronize render state");
++    }
++    Env host_env = {};
++    fzero_gpu_cuda_check(cudaMemcpy(&host_env, g_fzero_gpu.envs,
++        sizeof(host_env), cudaMemcpyDeviceToHost), "copy render state");
++    if (!IsWindowReady()) {
++        InitWindow(900, 300, "PufferLib F-Zero X CUDA telemetry");
++    }
++    BeginDrawing();
++    ClearBackground((Color){12, 18, 28, 255});
++    DrawText("F-Zero X reduced simulator is stepping on CUDA", 24, 24, 28, RAYWHITE);
++    DrawText(TextFormat("Decision: %u   Frame: %u   Batch: %d",
++        host_env.state.episode_decisions, host_env.state.episode_frame,
++        g_fzero_gpu.n), 24, 78, 22, LIGHTGRAY);
++    DrawText(TextFormat("Distance: %.1f   Speed: %.1f   Lateral: %.1f   Energy: %.1f",
++        host_env.state.race_distance, host_env.state.speed,
++        host_env.state.lateral, host_env.state.energy), 24, 118, 22, LIGHTGRAY);
++    DrawText("CPU G-Diffuser remains the policy-transfer oracle.", 24, 174, 20, GRAY);
++    EndDrawing();
++    puf_web_vsync();
++}
++
++void puf_close(Env*) {
++    if (IsWindowReady()) {
++        CloseWindow();
++    }
++    cudaFree(g_fzero_gpu.course);
++    cudaFree(g_fzero_gpu.envs);
++    g_fzero_gpu.course = NULL;
++    g_fzero_gpu.envs = NULL;
++    free(g_fzero_gpu.host_course);
++    g_fzero_gpu.host_course = NULL;
++    /* The oracle DSO owns live ucontexts and intentionally remains loaded for process life. */
++}
++
++void puf_log(Log* log, Dict* out) {
++    dict_set(out, "perf", log->perf);
++    dict_set(out, "score", log->score);
++    dict_set(out, "episode_return", log->episode_return);
++    dict_set(out, "learner_return", log->learner_return);
++    dict_set(out, "episode_length", log->episode_length);
++    dict_set(out, "episode_frames", log->episode_frames);
++    dict_set(out, "race_distance", log->race_distance);
++    dict_set(out, "terminal_speed", log->terminal_speed);
++    dict_set(out, "terminal_energy", log->terminal_energy);
++    dict_set(out, "terminal_lap", log->terminal_lap);
++    dict_set(out, "finish_rate", log->finish_rate);
++    dict_set(out, "terminated_rate", log->terminated_rate);
++    dict_set(out, "truncated_rate", log->truncated_rate);
++    dict_set(out, "spinning_out_rate", log->spinning_out_rate);
++    dict_set(out, "falling_rate", log->falling_rate);
++    dict_set(out, "crashed_rate", log->crashed_rate);
++    dict_set(out, "retired_rate", log->retired_rate);
++    dict_set(out, "time_limit_rate", log->time_limit_rate);
++    dict_set(out, "stalled_rate", log->stalled_rate);
++    for (int category = 0; category < GDX_RL_STEER_BINS; ++category) {
++        char key[32];
++        snprintf(key, sizeof(key), "steer_%02d_fraction", category);
++        dict_set(out, key, log->steer_fraction[category]);
++    }
++    for (int category = 0; category < GDX_RL_PITCH_BINS; ++category) {
++        char key[32];
++        snprintf(key, sizeof(key), "pitch_%02d_fraction", category);
++        dict_set(out, key, log->pitch_fraction[category]);
++    }
++    dict_set(out, "throttle_on_fraction", log->throttle_on_fraction);
++    dict_set(out, "brake_on_fraction", log->brake_on_fraction);
++    dict_set(out, "boost_on_fraction", log->boost_on_fraction);
++    dict_set(out, "n", log->n);
++}
++
++#endif
+diff --git a/ocean/fzero/fzero.h b/ocean/fzero/fzero.h
+new file mode 100644
+index 00000000..1320c055
+--- /dev/null
++++ b/ocean/fzero/fzero.h
+@@ -0,0 +1,814 @@
++#pragma once
++
++#include <dlfcn.h>
++#include <link.h>
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../../../G-Diffuser/port/rl/gdx_rl_env.h"
++
++typedef float obs_t;
++#include "pufferenv.h"
++
++#define OBS_SIZE GDX_RL_OBSERVATION_SIZE
++#define NUM_ATNS GDX_RL_ACTION_SIZE
++#define ACT_SIZES {11, 5, 2, 2, 2}
++
++enum {
++    FZERO_STEER_MASK_OFFSET = 0,
++    FZERO_PITCH_MASK_OFFSET = 11,
++    FZERO_THROTTLE_MASK_OFFSET = 16,
++    FZERO_BRAKE_MASK_OFFSET = 18,
++    FZERO_BOOST_MASK_OFFSET = 20,
++    FZERO_ACTION_MASK_SIZE = 22,
++};
++
++static const int32_t FZERO_ACTION_NVECS[GDX_RL_ACTION_SIZE] = {11, 5, 2, 2, 2};
++static const int8_t FZERO_STEER_VALUES[GDX_RL_STEER_BINS] = {
++    0, -13, 13, -25, 25, -38, 38, -50, 50, -63, 63,
++};
++static const int8_t FZERO_PITCH_VALUES[GDX_RL_PITCH_BINS] = {0, -32, 32, -63, 63};
++
++/* Standalone CPU evaluation can export the exact post-curriculum action stream
++ * for deterministic playback by G-Diffuser's GDX_INPUT_SCRIPT input seam. */
++#define PUF_SUPPORTS_GDX_INPUT_SCRIPT 1
++
++typedef struct FZeroGdxInputTrace {
++    FILE* file;
++    char* final_path;
++    char* temporary_path;
++    uint32_t decisions;
++    uint32_t episode_frame;
++    uint32_t reset_seed;
++    uint32_t sampler_seed;
++    uint8_t complete;
++} FZeroGdxInputTrace;
++
++typedef struct FZeroApi {
++    void* handle;
++    uint32_t (*abi_version)(void);
++    void (*default_config)(GdxRlConfig*);
++    int (*init)(const char*, const GdxRlConfig*);
++    int (*bind_thread)(void);
++    int (*reset)(uint32_t, float*);
++    int (*step)(const int32_t*, float*, GdxRlTransition*);
++    uint64_t (*semantic_hash)(void);
++    const char* (*last_error)(void);
++    const int32_t* action_nvec;
++} FZeroApi;
++
++struct Log {
++    float perf;
++    float score;
++    float episode_return;
++    float learner_return;
++    float episode_length;
++    float episode_frames;
++    float finish_frames;
++    float dash_hits;
++    float race_distance;
++    float terminal_speed;
++    float terminal_energy;
++    float terminal_lap;
++    float finish_rate;
++    float terminated_rate;
++    float truncated_rate;
++    float spinning_out_rate;
++    float falling_rate;
++    float crashed_rate;
++    float retired_rate;
++    float time_limit_rate;
++    float stalled_rate;
++    float steer_fraction[GDX_RL_STEER_BINS];
++    float pitch_fraction[GDX_RL_PITCH_BINS];
++    float throttle_on_fraction;
++    float brake_on_fraction;
++    float boost_on_fraction;
++    float n;
++};
++
++struct Env {
++    Log log;
++    Agent agents[1];
++    int tag;
++    int boundary_reached;
++
++    int num_agents;
++    unsigned int rng;
++    uint32_t seed_base;
++    uint32_t reset_count;
++    uint32_t last_reset_seed;
++    float episode_return;
++    float learner_return;
++    float reward_scale;
++    float finish_time_target_frames;
++    float dash_hit_reward;
++    uint8_t steering_curriculum;
++    int32_t action_repeat;
++    uint32_t episode_decisions;
++    uint32_t episode_dash_hits;
++    uint32_t steer_counts[GDX_RL_STEER_BINS];
++    uint32_t pitch_counts[GDX_RL_PITCH_BINS];
++    uint32_t throttle_on_count;
++    uint32_t brake_on_count;
++    uint32_t boost_on_count;
++    GdxRlTransition last_transition;
++    FZeroGdxInputTrace* gdx_input_trace;
++
++    FZeroApi api;
++};
++typedef Env FZero;
++
++static inline void fzero_fatal(const char* operation, const char* detail) {
++    fprintf(stderr, "fzero: %s: %s\n", operation,
++        detail != NULL && detail[0] != '\0' ? detail : "unknown error");
++    fflush(stderr);
++    exit(EXIT_FAILURE);
++}
++
++static inline void fzero_core_check(FZero* env, const char* operation, int result) {
++    if (result == 0) {
++        return;
++    }
++    const char* detail = env->api.last_error != NULL
++        ? env->api.last_error() : "core call failed without gdx_rl_last_error";
++    fzero_fatal(operation, detail);
++}
++
++/* POSIX specifies dlsym for function symbols, but ISO C does not specify a
++ * void* -> function-pointer cast. Copying the representation keeps this header
++ * valid in both clang C (--cpu) and nvcc C++ (native trainer) builds. */
++static inline void fzero_load_symbol(
++        FZero* env, const char* name, void* destination, size_t destination_size) {
++    dlerror();
++    void* symbol = dlsym(env->api.handle, name);
++    const char* error = dlerror();
++    if (error != NULL || symbol == NULL) {
++        fzero_fatal(name, error != NULL ? error : "symbol resolved to null");
++    }
++    if (destination_size != sizeof(symbol)) {
++        fzero_fatal(name, "unsupported function/data pointer representation");
++    }
++    memcpy(destination, &symbol, sizeof(symbol));
++}
++
++static inline int32_t fzero_config_i32(Dict* kwargs, const char* key) {
++    double value = dict_get(kwargs, key);
++    if (!isfinite(value) || value != trunc(value)
++            || value < (double)INT32_MIN || value > (double)INT32_MAX) {
++        fprintf(stderr, "fzero: [env].%s must be an int32, got %.17g\n", key, value);
++        exit(EXIT_FAILURE);
++    }
++    return (int32_t)value;
++}
++
++static inline uint32_t fzero_config_u32(Dict* kwargs, const char* key) {
++    double value = dict_get(kwargs, key);
++    if (!isfinite(value) || value != trunc(value)
++            || value < 0.0 || value > (double)UINT32_MAX) {
++        fprintf(stderr, "fzero: [env].%s must be a uint32, got %.17g\n", key, value);
++        exit(EXIT_FAILURE);
++    }
++    return (uint32_t)value;
++}
++
++/* Returns zero on success, otherwise one plus the invalid component index. */
++static inline int fzero_decode_actions(
++        const float raw[GDX_RL_ACTION_SIZE],
++        int32_t decoded[GDX_RL_ACTION_SIZE]) {
++    if (raw == NULL || decoded == NULL) {
++        return 1;
++    }
++    for (int i = 0; i < GDX_RL_ACTION_SIZE; ++i) {
++        float value = raw[i];
++        if (!isfinite(value) || value != truncf(value)
++                || value < 0.0f || value >= (float)FZERO_ACTION_NVECS[i]) {
++            return i + 1;
++        }
++        decoded[i] = (int32_t)value;
++    }
++    return 0;
++}
++
++static inline int fzero_scale_reward(float raw_reward, float reward_scale, float* scaled_reward) {
++    if (scaled_reward == NULL || !isfinite(raw_reward) || !isfinite(reward_scale)) {
++        return -1;
++    }
++    float value = raw_reward * reward_scale;
++    if (!isfinite(value) || value < -1.0f || value > 1.0f) {
++        return -1;
++    }
++    *scaled_reward = value;
++    return 0;
++}
++
++/* Normalized outcome for the one-lap pace task. A zero target is the
++ * compatibility setting: every completed lap scores 1. Fatal outcomes score
++ * -1, while time-limit and stall truncations score 0. This outcome replaces
++ * the entire learner reward on the boundary transition; dense raw shaping is
++ * used only on nonterminal transitions. */
++static inline float fzero_completed_lap_score(
++        float target_frames, uint32_t episode_frame) {
++    if (!(target_frames > 0.0f)) {
++        return 1.0f;
++    }
++    if (episode_frame == 0) {
++        return 0.0f;
++    }
++    float score = target_frames / (float)episode_frame;
++    if (score < 0.0f) {
++        return 0.0f;
++    }
++    return score > 1.0f ? 1.0f : score;
++}
++
++static inline int fzero_terminal_outcome(const GdxRlTransition* transition,
++        float target_frames, float* outcome) {
++    if (transition == NULL || outcome == NULL) {
++        return 0;
++    }
++    switch (transition->reason) {
++        case GDX_RL_FINISHED:
++            *outcome = fzero_completed_lap_score(
++                target_frames, transition->episode_frame);
++            return 1;
++        case GDX_RL_SPINNING_OUT:
++        case GDX_RL_FALLING:
++        case GDX_RL_CRASHED:
++        case GDX_RL_RETIRED:
++            *outcome = -1.0f;
++            return 1;
++        case GDX_RL_TIME_LIMIT:
++        case GDX_RL_STALLED:
++            *outcome = 0.0f;
++            return 1;
++        default:
++            return 0;
++    }
++}
++
++static inline int fzero_compute_learner_reward(float raw_reward,
++        const GdxRlTransition* transition, float reward_scale,
++        float target_frames, float* learner_reward) {
++    if (learner_reward == NULL || !isfinite(raw_reward)) {
++        return -1;
++    }
++    if (fzero_terminal_outcome(transition, target_frames, learner_reward)) {
++        return 0;
++    }
++    return fzero_scale_reward(raw_reward, reward_scale, learner_reward);
++}
++
++/* The core counts dash-surface acquisition edges inside the raw physics-tick
++ * loop, so action repeat can neither miss a short pad nor pay every frame spent
++ * on one. Zero leaves the exact core reward unchanged. */
++static inline float fzero_shape_dash_reward(float raw_reward,
++        const GdxRlTransition* transition, float reward_per_hit) {
++    if (transition == NULL || !(reward_per_hit > 0.0f)) {
++        return raw_reward;
++    }
++    return raw_reward + reward_per_hit * (float)transition->dash_pad_hits;
++}
++
++static inline void fzero_write_action_mask(FZero* env) {
++    unsigned char* mask = env->agents[0].action_mask;
++    if (mask == NULL) {
++        return;
++    }
++    memset(mask, 1, FZERO_ACTION_MASK_SIZE);
++    if (!env->steering_curriculum) {
++        return;
++    }
++
++    memset(mask, 0, FZERO_ACTION_MASK_SIZE);
++    memset(mask + FZERO_STEER_MASK_OFFSET, 1, GDX_RL_STEER_BINS);
++    mask[FZERO_PITCH_MASK_OFFSET] = 1;
++    mask[FZERO_THROTTLE_MASK_OFFSET + 1] = 1;
++    mask[FZERO_BRAKE_MASK_OFFSET] = 1;
++    mask[FZERO_BOOST_MASK_OFFSET] = 1;
++}
++
++static inline int fzero_action_is_legal(const FZero* env,
++        const int32_t action[GDX_RL_ACTION_SIZE]) {
++    const unsigned char* mask = env->agents[0].action_mask;
++    if (mask == NULL) {
++        return 1;
++    }
++    const int offsets[GDX_RL_ACTION_SIZE] = {
++        FZERO_STEER_MASK_OFFSET,
++        FZERO_PITCH_MASK_OFFSET,
++        FZERO_THROTTLE_MASK_OFFSET,
++        FZERO_BRAKE_MASK_OFFSET,
++        FZERO_BOOST_MASK_OFFSET,
++    };
++    for (int head = 0; head < GDX_RL_ACTION_SIZE; ++head) {
++        if (mask[offsets[head] + action[head]] == 0) {
++            return 0;
++        }
++    }
++    return 1;
++}
++
++static inline void fzero_apply_curriculum(const FZero* env,
++        int32_t action[GDX_RL_ACTION_SIZE]) {
++    if (!env->steering_curriculum) {
++        return;
++    }
++    action[1] = 0;
++    action[2] = 1;
++    action[3] = 0;
++    action[4] = 0;
++}
++
++static inline const char* fzero_gdx_buttons(
++        int throttle, int brake, int boost, char output[32]) {
++    size_t used = 0;
++    output[0] = '\0';
++    const char* names[3] = {"A", "CDOWN", "B"};
++    const int enabled[3] = {throttle, brake, boost};
++    for (int i = 0; i < 3; ++i) {
++        if (!enabled[i]) {
++            continue;
++        }
++        if (used != 0) {
++            output[used++] = '+';
++        }
++        size_t length = strlen(names[i]);
++        memcpy(output + used, names[i], length);
++        used += length;
++        output[used] = '\0';
++    }
++    if (used == 0) {
++        memcpy(output, "-", 2);
++    }
++    return output;
++}
++
++/* Write one factorized action as the raw N64 pad polls consumed by the exact
++ * headless step. Boost is an edge-triggered B tap on repeat zero, followed by
++ * the same pad without B for the remaining repeats. */
++static inline int fzero_gdx_write_action(FILE* file, uint32_t decision,
++        int32_t repeat_ticks, const int32_t action[GDX_RL_ACTION_SIZE]) {
++    if (file == NULL || action == NULL || repeat_ticks < 1 || repeat_ticks > 16) {
++        return -1;
++    }
++    for (int i = 0; i < GDX_RL_ACTION_SIZE; ++i) {
++        if (action[i] < 0 || action[i] >= FZERO_ACTION_NVECS[i]) {
++            return -1;
++        }
++    }
++
++    const int steer = FZERO_STEER_VALUES[action[0]];
++    const int pitch = FZERO_PITCH_VALUES[action[1]];
++    char buttons[32];
++    if (fprintf(file, "# decision %u action %d %d %d %d %d\n",
++            decision, action[0], action[1], action[2], action[3], action[4]) < 0) {
++        return -1;
++    }
++    if (action[4] != 0) {
++        if (fprintf(file, "INPUT %s %d %d 1\n",
++                fzero_gdx_buttons(action[2], action[3], 1, buttons), steer, pitch) < 0) {
++            return -1;
++        }
++        if (repeat_ticks > 1 && fprintf(file, "INPUT %s %d %d %d\n",
++                fzero_gdx_buttons(action[2], action[3], 0, buttons), steer, pitch,
++                repeat_ticks - 1) < 0) {
++            return -1;
++        }
++    } else if (fprintf(file, "INPUT %s %d %d %d\n",
++            fzero_gdx_buttons(action[2], action[3], 0, buttons), steer, pitch,
++            repeat_ticks) < 0) {
++        return -1;
++    }
++    return ferror(file) ? -1 : 0;
++}
++
++static inline void fzero_gdx_input_trace_open(FZero* env, const char* output_path,
++        const char* checkpoint_path, uint32_t sampler_seed) {
++    if (env == NULL || output_path == NULL || output_path[0] == '\0' ||
++            env->gdx_input_trace != NULL) {
++        fzero_fatal("GDX input trace", "invalid or duplicate trace request");
++    }
++    size_t path_size = strlen(output_path) + 32;
++    FZeroGdxInputTrace* trace =
++        (FZeroGdxInputTrace*)calloc(1, sizeof(FZeroGdxInputTrace));
++    if (trace == NULL) {
++        fzero_fatal("GDX input trace", "failed to allocate trace state");
++    }
++    trace->final_path = (char*)malloc(path_size);
++    trace->temporary_path = (char*)malloc(path_size);
++    if (trace->final_path == NULL || trace->temporary_path == NULL) {
++        fzero_fatal("GDX input trace", "failed to allocate trace path");
++    }
++    snprintf(trace->final_path, path_size, "%s", output_path);
++    snprintf(trace->temporary_path, path_size, "%s.tmp", output_path);
++    trace->file = fopen(trace->temporary_path, "wb");
++    if (trace->file == NULL) {
++        fzero_fatal("GDX input trace", "failed to open temporary output");
++    }
++    trace->reset_seed = env->last_reset_seed;
++    trace->sampler_seed = sampler_seed;
++    env->gdx_input_trace = trace;
++
++    fprintf(trace->file,
++        "# G-Diffuser deterministic Puffer checkpoint replay\n"
++        "# Generated from the exact headless F-Zero X CPU environment.\n"
++        "# checkpoint %s\n"
++        "# environment_seed %u\n"
++        "# sampler_seed %u\n"
++        "# action_repeat %d\n"
++        "# action_nvec 11 5 2 2 2\n"
++        "# steer_values 0 -13 13 -25 25 -38 38 -50 50 -63 63\n"
++        "# pitch_values 0 -32 32 -63 63\n"
++        "LOG Puffer checkpoint replay started\n",
++        checkpoint_path != NULL ? checkpoint_path : "-", trace->reset_seed,
++        trace->sampler_seed, env->action_repeat);
++    if (ferror(trace->file)) {
++        fzero_fatal("GDX input trace", "failed to write trace header");
++    }
++}
++
++static inline void fzero_gdx_input_trace_record(FZero* env,
++        const int32_t action[GDX_RL_ACTION_SIZE],
++        const GdxRlTransition* transition) {
++    FZeroGdxInputTrace* trace = env != NULL ? env->gdx_input_trace : NULL;
++    if (trace == NULL || trace->complete) {
++        return;
++    }
++    if (transition == NULL || transition->episode_frame <= trace->episode_frame ||
++            transition->episode_frame - trace->episode_frame > (uint32_t)env->action_repeat) {
++        fzero_fatal("GDX input trace", "transition has an invalid physics-tick delta");
++    }
++    uint32_t repeat_ticks = transition->episode_frame - trace->episode_frame;
++    if (fzero_gdx_write_action(trace->file, trace->decisions,
++            (int32_t)repeat_ticks, action) != 0) {
++        fzero_fatal("GDX input trace", "failed to write action");
++    }
++    trace->episode_frame = transition->episode_frame;
++    trace->decisions++;
++}
++
++static inline void fzero_gdx_input_trace_finish(FZero* env,
++        const GdxRlTransition* transition) {
++    FZeroGdxInputTrace* trace = env != NULL ? env->gdx_input_trace : NULL;
++    if (trace == NULL || trace->complete || transition == NULL) {
++        return;
++    }
++    const int finished = transition->reason == GDX_RL_FINISHED;
++    fprintf(trace->file,
++        "# result decisions %u raw_score %.9g reason %u terminated %u truncated %u "
++        "episode_frame %u race_distance %.9g semantic_hash %016llx\n"
++        "LOG Puffer policy trace exhausted; waiting for rendered terminal\n"
++        "WAIT 120\n"
++        "SHOT %s\n"
++        "WAIT 2\n"
++        "QUIT\n",
++        trace->decisions, env->episode_return, (unsigned)transition->reason,
++        (unsigned)transition->terminated, (unsigned)transition->truncated,
++        transition->episode_frame, transition->race_distance,
++        (unsigned long long)transition->semantic_hash,
++        finished ? "puffer-fzero-finish" : "puffer-fzero-terminal");
++    if (ferror(trace->file) || fclose(trace->file) != 0) {
++        trace->file = NULL;
++        fzero_fatal("GDX input trace", "failed to finalize trace output");
++    }
++    trace->file = NULL;
++    if (rename(trace->temporary_path, trace->final_path) != 0) {
++        fzero_fatal("GDX input trace", "failed to publish trace output");
++    }
++    trace->complete = 1;
++}
++
++static inline int fzero_gdx_input_trace_complete(const FZero* env) {
++    return env != NULL && env->gdx_input_trace != NULL &&
++        env->gdx_input_trace->complete != 0;
++}
++
++static inline void fzero_bind_current_thread(FZero* env) {
++    /* Reaffirm the core's ucontext TLS at every quiescent API boundary. pthread ids can be reused
++     * after a worker exits, so equality with a cached id is not proof that this thread is bound. */
++    fzero_core_check(env, "gdx_rl_bind_thread", env->api.bind_thread());
++}
++
++static inline void fzero_load_api(FZero* env, const char* library_path) {
++    env->api.handle = dlmopen(LM_ID_NEWLM, library_path, RTLD_NOW | RTLD_LOCAL);
++    if (env->api.handle == NULL) {
++        fzero_fatal("dlmopen", dlerror());
++    }
++
++    fzero_load_symbol(env, "gdx_rl_abi_version",
++        &env->api.abi_version, sizeof(env->api.abi_version));
++    fzero_load_symbol(env, "gdx_rl_default_config",
++        &env->api.default_config, sizeof(env->api.default_config));
++    fzero_load_symbol(env, "gdx_rl_init", &env->api.init, sizeof(env->api.init));
++    fzero_load_symbol(env, "gdx_rl_bind_thread",
++        &env->api.bind_thread, sizeof(env->api.bind_thread));
++    fzero_load_symbol(env, "gdx_rl_reset", &env->api.reset, sizeof(env->api.reset));
++    fzero_load_symbol(env, "gdx_rl_step", &env->api.step, sizeof(env->api.step));
++    fzero_load_symbol(env, "gdx_rl_semantic_hash",
++        &env->api.semantic_hash, sizeof(env->api.semantic_hash));
++    fzero_load_symbol(env, "gdx_rl_last_error",
++        &env->api.last_error, sizeof(env->api.last_error));
++    fzero_load_symbol(env, "gdx_rl_action_nvec",
++        &env->api.action_nvec, sizeof(env->api.action_nvec));
++
++    uint32_t version = env->api.abi_version();
++    if (version != GDX_RL_ABI_VERSION) {
++        fprintf(stderr, "fzero: ABI version mismatch: adapter=%u core=%u\n",
++            (unsigned)GDX_RL_ABI_VERSION, (unsigned)version);
++        exit(EXIT_FAILURE);
++    }
++    for (int i = 0; i < GDX_RL_ACTION_SIZE; ++i) {
++        if (env->api.action_nvec[i] != FZERO_ACTION_NVECS[i]) {
++            fprintf(stderr,
++                "fzero: action nvec mismatch at %d: adapter=%d core=%d\n",
++                i, FZERO_ACTION_NVECS[i], env->api.action_nvec[i]);
++            exit(EXIT_FAILURE);
++        }
++    }
++}
++
++void puf_init(FZero* env, Dict* kwargs) {
++    env->num_agents = 1;
++    env->agents[0].policy = 0;
++    env->agents[0].action_mask = NULL;
++    env->tag = 0;
++    env->boundary_reached = 0;
++
++    const char* library_path = dict_get_str(kwargs, "core_lib_path");
++    const char* rom_path = dict_get_str(kwargs, "rom_path");
++    const char* rom_override = getenv("FZEROX_ROM");
++    if (rom_override != NULL && rom_override[0] != '\0') {
++        rom_path = rom_override;
++    }
++    fzero_load_api(env, library_path);
++
++    GdxRlConfig config;
++    env->api.default_config(&config);
++    config.course_index = fzero_config_i32(kwargs, "course_index");
++    config.character = fzero_config_i32(kwargs, "character");
++    config.machine_skin = fzero_config_i32(kwargs, "machine_skin");
++    config.laps = fzero_config_i32(kwargs, "laps");
++    config.action_repeat = fzero_config_i32(kwargs, "action_repeat");
++    env->action_repeat = config.action_repeat;
++    config.max_episode_frames = fzero_config_i32(kwargs, "max_episode_frames");
++    config.stall_frames = fzero_config_i32(kwargs, "stall_frames");
++    config.stall_progress = (float)dict_get(kwargs, "stall_progress");
++    config.engine_balance = (float)dict_get(kwargs, "engine_balance");
++    double reward_scale = dict_get(kwargs, "reward_scale");
++    if (!isfinite(reward_scale) || reward_scale <= 0.0 || reward_scale > 0.03125) {
++        fzero_fatal("configuration", "reward_scale must be finite and in (0, 1/32]");
++    }
++    env->reward_scale = (float)reward_scale;
++    if (!isfinite(env->reward_scale) || env->reward_scale <= 0.0f) {
++        fzero_fatal("configuration", "reward_scale underflows float32");
++    }
++    double finish_time_target_frames = dict_get(kwargs, "finish_time_target_frames");
++    if (!isfinite(finish_time_target_frames) || finish_time_target_frames < 0.0) {
++        fzero_fatal("configuration",
++            "finish_time_target_frames must be finite and non-negative");
++    }
++    env->finish_time_target_frames = (float)finish_time_target_frames;
++    double dash_hit_reward = dict_get(kwargs, "dash_hit_reward");
++    if (!isfinite(dash_hit_reward) || dash_hit_reward < 0.0 ||
++            dash_hit_reward > 0.1) {
++        fzero_fatal("configuration",
++            "dash_hit_reward must be finite and in [0, 0.1]");
++    }
++    env->dash_hit_reward = (float)dash_hit_reward;
++    int32_t cpu_oracle = fzero_config_i32(kwargs, "cpu_oracle");
++    if (cpu_oracle != 0 && cpu_oracle != 1) {
++        fzero_fatal("configuration", "cpu_oracle must be 0 or 1");
++    }
++    config.cpu_oracle = (uint8_t)cpu_oracle;
++    int32_t steering_curriculum = fzero_config_i32(kwargs, "steering_curriculum");
++    if (steering_curriculum != 0 && steering_curriculum != 1) {
++        fzero_fatal("configuration", "steering_curriculum must be 0 or 1");
++    }
++    env->steering_curriculum = (uint8_t)steering_curriculum;
++
++    /* Puffer seeds Env.rng with the environment index before puf_init. Keep
++     * reset streams deterministic and distinct without using global rand(). */
++    uint32_t configured_seed = fzero_config_u32(kwargs, "seed");
++    env->seed_base = configured_seed + (uint32_t)env->rng * UINT32_C(1000003);
++    env->reset_count = 0;
++
++    fzero_core_check(env, "gdx_rl_init", env->api.init(rom_path, &config));
++}
++
++void puf_reset(FZero* env) {
++    if (env->agents[0].observations == NULL) {
++        fzero_fatal("puf_reset", "observation buffer is not bound");
++    }
++    fzero_bind_current_thread(env);
++    env->last_reset_seed = env->seed_base + env->reset_count++;
++    fzero_core_check(env, "gdx_rl_reset",
++        env->api.reset(env->last_reset_seed, env->agents[0].observations));
++    env->episode_return = 0.0f;
++    env->learner_return = 0.0f;
++    env->episode_decisions = 0;
++    env->episode_dash_hits = 0;
++    memset(env->steer_counts, 0, sizeof(env->steer_counts));
++    memset(env->pitch_counts, 0, sizeof(env->pitch_counts));
++    env->throttle_on_count = 0;
++    env->brake_on_count = 0;
++    env->boost_on_count = 0;
++    fzero_write_action_mask(env);
++    if (env->agents[0].rewards != NULL) {
++        env->agents[0].rewards[0] = 0.0f;
++    }
++    if (env->agents[0].terminals != NULL) {
++        env->agents[0].terminals[0] = 0.0f;
++    }
++}
++
++static inline void fzero_add_log(FZero* env, const GdxRlTransition* transition) {
++    const int finished = transition->reason == GDX_RL_FINISHED;
++    float outcome = 0.0f;
++    (void)fzero_terminal_outcome(
++        transition, env->finish_time_target_frames, &outcome);
++    env->log.perf += outcome;
++    env->log.score += outcome;
++    env->log.episode_return += env->episode_return;
++    env->log.learner_return += env->learner_return;
++    env->log.episode_length += (float)env->episode_decisions;
++    env->log.episode_frames += (float)transition->episode_frame;
++    env->log.finish_frames += finished ? (float)transition->episode_frame : 0.0f;
++    env->log.dash_hits += (float)env->episode_dash_hits;
++    env->log.race_distance += transition->race_distance;
++    env->log.terminal_speed += transition->speed;
++    env->log.terminal_energy += transition->energy_fraction;
++    env->log.terminal_lap += (float)transition->lap;
++    env->log.finish_rate += finished ? 1.0f : 0.0f;
++    env->log.terminated_rate += transition->terminated ? 1.0f : 0.0f;
++    env->log.truncated_rate += transition->truncated ? 1.0f : 0.0f;
++    env->log.spinning_out_rate += transition->reason == GDX_RL_SPINNING_OUT ? 1.0f : 0.0f;
++    env->log.falling_rate += transition->reason == GDX_RL_FALLING ? 1.0f : 0.0f;
++    env->log.crashed_rate += transition->reason == GDX_RL_CRASHED ? 1.0f : 0.0f;
++    env->log.retired_rate += transition->reason == GDX_RL_RETIRED ? 1.0f : 0.0f;
++    env->log.time_limit_rate += transition->reason == GDX_RL_TIME_LIMIT ? 1.0f : 0.0f;
++    env->log.stalled_rate += transition->reason == GDX_RL_STALLED ? 1.0f : 0.0f;
++    if (env->episode_decisions > 0) {
++        float inv_decisions = 1.0f / (float)env->episode_decisions;
++        for (int category = 0; category < GDX_RL_STEER_BINS; ++category) {
++            env->log.steer_fraction[category] +=
++                (float)env->steer_counts[category] * inv_decisions;
++        }
++        for (int category = 0; category < GDX_RL_PITCH_BINS; ++category) {
++            env->log.pitch_fraction[category] +=
++                (float)env->pitch_counts[category] * inv_decisions;
++        }
++        env->log.throttle_on_fraction += (float)env->throttle_on_count * inv_decisions;
++        env->log.brake_on_fraction += (float)env->brake_on_count * inv_decisions;
++        env->log.boost_on_fraction += (float)env->boost_on_count * inv_decisions;
++    }
++    env->log.n += 1.0f;
++}
++
++void puf_step(FZero* env) {
++    Agent* agent = &env->agents[0];
++    if (agent->observations == NULL || agent->actions == NULL
++            || agent->rewards == NULL || agent->terminals == NULL) {
++        fzero_fatal("puf_step", "agent buffers are not bound");
++    }
++    fzero_bind_current_thread(env);
++
++    int32_t action[GDX_RL_ACTION_SIZE];
++    int invalid = fzero_decode_actions(agent->actions, action);
++    if (invalid != 0) {
++        int index = invalid - 1;
++        fprintf(stderr,
++            "fzero: invalid action category at index %d: %.9g (expected integer in [0, %d))\n",
++            index, agent->actions[index], FZERO_ACTION_NVECS[index]);
++        exit(EXIT_FAILURE);
++    }
++    /* The mask makes PPO sample these fixed heads. Reapply them here so direct
++     * CPU/manual callers receive the same curriculum semantics before a model
++     * is loaded and while their action buffer is still zero-filled. */
++    fzero_apply_curriculum(env, action);
++    if (!fzero_action_is_legal(env, action)) {
++        fzero_fatal("action mask", "policy sampled an action disabled by the current curriculum");
++    }
++    GdxRlTransition transition = {0};
++    fzero_core_check(env, "gdx_rl_step",
++        env->api.step(action, agent->observations, &transition));
++    transition.reward = fzero_shape_dash_reward(
++        transition.reward, &transition, env->dash_hit_reward);
++    fzero_gdx_input_trace_record(env, action, &transition);
++    env->last_transition = transition;
++    env->episode_return += transition.reward;
++    float learner_reward = 0.0f;
++    if (fzero_compute_learner_reward(transition.reward, &transition,
++            env->reward_scale, env->finish_time_target_frames,
++            &learner_reward) != 0) {
++        fzero_fatal("learner reward",
++            "reward must remain finite and in [-1, 1]");
++    }
++    env->learner_return += learner_reward;
++    env->episode_decisions += 1;
++    env->episode_dash_hits += (uint32_t)transition.dash_pad_hits;
++    env->steer_counts[action[0]] += 1;
++    env->pitch_counts[action[1]] += 1;
++    env->throttle_on_count += (uint32_t)action[2];
++    env->brake_on_count += (uint32_t)action[3];
++    env->boost_on_count += (uint32_t)action[4];
++
++    const int done = transition.terminated != 0 || transition.truncated != 0;
++    const float terminal_reward = learner_reward;
++    agent->rewards[0] = learner_reward;
++    agent->terminals[0] = done ? 1.0f : 0.0f;
++    env->boundary_reached = done;
++
++    if (done) {
++        fzero_gdx_input_trace_finish(env, &transition);
++        fzero_add_log(env, &transition);
++        /* Puffer consumes reward/terminal from this transition alongside the
++         * observation returned here. Reset immediately so that observation is
++         * the next episode's first state, then restore the terminal outputs. */
++        puf_reset(env);
++        agent->rewards[0] = terminal_reward;
++        agent->terminals[0] = 1.0f;
++        env->last_transition = transition;
++        env->boundary_reached = 1;
++    }
++}
++
++void puf_render(FZero* env) {
++    if (!IsWindowReady()) {
++        InitWindow(900, 300, "PufferLib F-Zero X (headless telemetry)");
++    }
++    BeginDrawing();
++    ClearBackground((Color){12, 18, 28, 255});
++    DrawText("F-Zero X core is running headless", 24, 24, 28, RAYWHITE);
++    DrawText(TextFormat("Reset seed: %u   Decision: %u   Frame: %u",
++        env->last_reset_seed, env->episode_decisions,
++        env->last_transition.episode_frame), 24, 78, 22, LIGHTGRAY);
++    DrawText(TextFormat("Reward: %.4f   Distance: %.1f   Speed: %.1f   Energy: %.3f",
++        env->agents[0].rewards != NULL ? env->agents[0].rewards[0] : 0.0f,
++        env->last_transition.race_distance, env->last_transition.speed,
++        env->last_transition.energy_fraction), 24, 118, 22, LIGHTGRAY);
++    DrawText("Use --headless for throughput/evaluation; no video renderer is loaded.",
++        24, 174, 20, GRAY);
++    EndDrawing();
++    puf_web_vsync();
++}
++
++void puf_close(FZero* env) {
++    if (IsWindowReady()) {
++        CloseWindow();
++    }
++    if (env != NULL && env->gdx_input_trace != NULL) {
++        FZeroGdxInputTrace* trace = env->gdx_input_trace;
++        if (trace->file != NULL) {
++            fclose(trace->file);
++        }
++        free(trace->final_path);
++        free(trace->temporary_path);
++        free(trace);
++        env->gdx_input_trace = NULL;
++    }
++    /* The game owns live ucontexts and process-lifetime caches. Its ABI has no
++     * close entry point, so unloading the namespace with dlclose is unsafe. */
++}
++
++void puf_log(Log* log, Dict* out) {
++    dict_set(out, "perf", log->perf);
++    dict_set(out, "score", log->score);
++    dict_set(out, "episode_return", log->episode_return);
++    dict_set(out, "learner_return", log->learner_return);
++    dict_set(out, "episode_length", log->episode_length);
++    dict_set(out, "episode_frames", log->episode_frames);
++    dict_set(out, "finish_frames", log->finish_rate > 0.0f
++        ? log->finish_frames / log->finish_rate : 0.0f);
++    dict_set(out, "dash_hits", log->dash_hits);
++    dict_set(out, "race_distance", log->race_distance);
++    dict_set(out, "terminal_speed", log->terminal_speed);
++    dict_set(out, "terminal_energy", log->terminal_energy);
++    dict_set(out, "terminal_lap", log->terminal_lap);
++    dict_set(out, "finish_rate", log->finish_rate);
++    dict_set(out, "terminated_rate", log->terminated_rate);
++    dict_set(out, "truncated_rate", log->truncated_rate);
++    dict_set(out, "spinning_out_rate", log->spinning_out_rate);
++    dict_set(out, "falling_rate", log->falling_rate);
++    dict_set(out, "crashed_rate", log->crashed_rate);
++    dict_set(out, "retired_rate", log->retired_rate);
++    dict_set(out, "time_limit_rate", log->time_limit_rate);
++    dict_set(out, "stalled_rate", log->stalled_rate);
++    for (int category = 0; category < GDX_RL_STEER_BINS; ++category) {
++        char key[32];
++        snprintf(key, sizeof(key), "steer_%02d_fraction", category);
++        dict_set(out, key, log->steer_fraction[category]);
++    }
++    for (int category = 0; category < GDX_RL_PITCH_BINS; ++category) {
++        char key[32];
++        snprintf(key, sizeof(key), "pitch_%02d_fraction", category);
++        dict_set(out, key, log->pitch_fraction[category]);
++    }
++    dict_set(out, "throttle_on_fraction", log->throttle_on_fraction);
++    dict_set(out, "brake_on_fraction", log->brake_on_fraction);
++    dict_set(out, "boost_on_fraction", log->boost_on_fraction);
++    dict_set(out, "n", log->n);
++}
+diff --git a/ocean/fzero/fzero_gpu_core.cuh b/ocean/fzero/fzero_gpu_core.cuh
+new file mode 100644
+index 00000000..a666e047
+--- /dev/null
++++ b/ocean/fzero/fzero_gpu_core.cuh
+@@ -0,0 +1,553 @@
++#pragma once
++
++#include <math.h>
++#include <stdint.h>
++
++#include "../../../G-Diffuser/port/rl/gdx_rl_env.h"
++
++#if defined(__CUDACC__)
++#define FZERO_GPU_HD __host__ __device__ __forceinline__
++#else
++#define FZERO_GPU_HD inline
++#endif
++
++enum {
++    FZERO_GPU_RUNNING = 0,
++    FZERO_GPU_FINISHED = 1,
++    FZERO_GPU_SPINNING_OUT = 2,
++    FZERO_GPU_FALLING = 3,
++    FZERO_GPU_CRASHED = 4,
++    FZERO_GPU_RETIRED = 5,
++    FZERO_GPU_TIME_LIMIT = 6,
++    FZERO_GPU_STALLED = 7,
++};
++
++static constexpr float FZERO_GPU_MAX_SPEED = 138.9f;
++typedef struct FZeroGpuVec3 {
++    float x;
++    float y;
++    float z;
++} FZeroGpuVec3;
++
++typedef struct FZeroGpuTrackFrame {
++    FZeroGpuVec3 position;
++    FZeroGpuVec3 forward;
++    FZeroGpuVec3 up;
++    FZeroGpuVec3 side;
++    float radius_left;
++    float radius_right;
++    uint32_t track_segment_info;
++    int32_t segment_index;
++} FZeroGpuTrackFrame;
++
++typedef struct FZeroGpuConfig {
++    int32_t sample_count;
++    int32_t dash_pad_count;
++    int32_t laps;
++    int32_t action_repeat;
++    int32_t max_episode_frames;
++    int32_t stall_frames;
++    int32_t steering_curriculum;
++    float course_length;
++    float sample_spacing;
++    float stall_progress;
++    float reward_scale;
++    float finish_time_target_frames;
++    float engine_target_speed;
++    float engine_acceleration;
++    float forward_drag;
++    float brake_drag;
++    float steering_rate;
++    float wall_margin;
++    float initial_race_distance;
++    float initial_lap_distance;
++    float initial_lateral;
++    float initial_vertical;
++    float initial_speed;
++    float initial_energy;
++    float max_energy;
++    uint32_t seed;
++} FZeroGpuConfig;
++
++typedef struct FZeroGpuState {
++    float race_distance;
++    float lap_distance;
++    float lateral;
++    float vertical;
++    float yaw;
++    float speed;
++    float energy;
++    float best_distance;
++    float progress_checkpoint;
++    float episode_return;
++    float learner_return;
++    uint32_t episode_frame;
++    uint32_t frames_without_progress;
++    uint32_t episode_decisions;
++    uint32_t reset_count;
++    uint32_t rng;
++    int32_t boost_timer;
++    int32_t laps_completed;
++    int32_t previous_action[GDX_RL_ACTION_SIZE];
++    uint32_t steer_counts[GDX_RL_STEER_BINS];
++    uint32_t pitch_counts[GDX_RL_PITCH_BINS];
++    uint32_t throttle_on_count;
++    uint32_t brake_on_count;
++    uint32_t boost_on_count;
++} FZeroGpuState;
++
++typedef struct FZeroGpuStepResult {
++    float raw_reward;
++    float learner_reward;
++    int32_t reason;
++    int32_t terminated;
++    int32_t truncated;
++} FZeroGpuStepResult;
++
++FZERO_GPU_HD float fzero_gpu_clampf(float value, float low, float high) {
++    return fminf(high, fmaxf(low, value));
++}
++
++FZERO_GPU_HD float fzero_gpu_clamp_unit(float value) {
++    return fzero_gpu_clampf(value, -1.0f, 1.0f);
++}
++
++FZERO_GPU_HD float fzero_gpu_clamp_zero_one(float value) {
++    return fzero_gpu_clampf(value, 0.0f, 1.0f);
++}
++
++FZERO_GPU_HD FZeroGpuVec3 fzero_gpu_vec3(float x, float y, float z) {
++    FZeroGpuVec3 result = {x, y, z};
++    return result;
++}
++
++FZERO_GPU_HD FZeroGpuVec3 fzero_gpu_add(FZeroGpuVec3 a, FZeroGpuVec3 b) {
++    return fzero_gpu_vec3(a.x + b.x, a.y + b.y, a.z + b.z);
++}
++
++FZERO_GPU_HD FZeroGpuVec3 fzero_gpu_sub(FZeroGpuVec3 a, FZeroGpuVec3 b) {
++    return fzero_gpu_vec3(a.x - b.x, a.y - b.y, a.z - b.z);
++}
++
++FZERO_GPU_HD FZeroGpuVec3 fzero_gpu_scale(FZeroGpuVec3 value, float scale) {
++    return fzero_gpu_vec3(value.x * scale, value.y * scale, value.z * scale);
++}
++
++FZERO_GPU_HD float fzero_gpu_dot(FZeroGpuVec3 a, FZeroGpuVec3 b) {
++    return a.x * b.x + a.y * b.y + a.z * b.z;
++}
++
++FZERO_GPU_HD FZeroGpuVec3 fzero_gpu_cross(FZeroGpuVec3 a, FZeroGpuVec3 b) {
++    return fzero_gpu_vec3(
++        a.y * b.z - a.z * b.y,
++        a.z * b.x - a.x * b.z,
++        a.x * b.y - a.y * b.x);
++}
++
++FZERO_GPU_HD FZeroGpuVec3 fzero_gpu_normalize(FZeroGpuVec3 value) {
++    float length_squared = fzero_gpu_dot(value, value);
++    if (!(length_squared > 1.0e-12f)) {
++        return fzero_gpu_vec3(1.0f, 0.0f, 0.0f);
++    }
++    return fzero_gpu_scale(value, 1.0f / sqrtf(length_squared));
++}
++
++FZERO_GPU_HD int fzero_gpu_steer_value(int category) {
++    switch (category) {
++        case 1: return -13;
++        case 2: return 13;
++        case 3: return -25;
++        case 4: return 25;
++        case 5: return -38;
++        case 6: return 38;
++        case 7: return -50;
++        case 8: return 50;
++        case 9: return -63;
++        case 10: return 63;
++        default: return 0;
++    }
++}
++
++FZERO_GPU_HD int fzero_gpu_pitch_value(int category) {
++    switch (category) {
++        case 1: return -32;
++        case 2: return 32;
++        case 3: return -63;
++        case 4: return 63;
++        default: return 0;
++    }
++}
++
++FZERO_GPU_HD float fzero_gpu_lookahead(int index) {
++    switch (index) {
++        case 0: return 250.0f;
++        case 1: return 500.0f;
++        case 2: return 1000.0f;
++        case 3: return 2000.0f;
++        case 4: return 4000.0f;
++        default: return 8000.0f;
++    }
++}
++
++FZERO_GPU_HD FZeroGpuVec3 fzero_gpu_lerp_vec3(
++        const float a[3], const float b[3], float t) {
++    return fzero_gpu_vec3(
++        a[0] + (b[0] - a[0]) * t,
++        a[1] + (b[1] - a[1]) * t,
++        a[2] + (b[2] - a[2]) * t);
++}
++
++FZERO_GPU_HD float fzero_gpu_wrap(float distance, float length) {
++    float wrapped = fmodf(distance, length);
++    return wrapped < 0.0f ? wrapped + length : wrapped;
++}
++
++FZERO_GPU_HD void fzero_gpu_nearest_dash_observation(
++        float lap_distance, const FZeroGpuConfig* config,
++        const GdxRlDashPad* dash_pads, float output[4]) {
++    output[0] = 0.0f;
++    output[1] = 0.0f;
++    output[2] = 0.0f;
++    output[3] = 0.0f;
++    if (config->dash_pad_count <= 0 || dash_pads == nullptr ||
++            !(config->course_length > 0.0f)) {
++        return;
++    }
++
++    float best_delta = config->course_length;
++    int best_index = 0;
++    for (int i = 0; i < config->dash_pad_count; ++i) {
++        const float delta = fzero_gpu_wrap(
++            dash_pads[i].entry_distance - lap_distance, config->course_length);
++        if (delta < best_delta) {
++            best_delta = delta;
++            best_index = i;
++        }
++    }
++
++    const GdxRlDashPad* nearest = &dash_pads[best_index];
++    output[0] = 1.0f;
++    output[1] = fzero_gpu_clamp_zero_one(best_delta / 8000.0f);
++    output[2] = fzero_gpu_clamp_unit(nearest->target);
++    output[3] = fzero_gpu_clamp_zero_one(nearest->width);
++}
++
++FZERO_GPU_HD float fzero_gpu_terminal_outcome(
++        int reason, uint32_t episode_frame, float finish_time_target_frames) {
++    if (reason == FZERO_GPU_FINISHED) {
++        if (!(finish_time_target_frames > 0.0f)) {
++            return 1.0f;
++        }
++        if (episode_frame == 0) {
++            return 0.0f;
++        }
++        return fzero_gpu_clamp_zero_one(
++            finish_time_target_frames / (float)episode_frame);
++    }
++    if (reason == FZERO_GPU_TIME_LIMIT || reason == FZERO_GPU_STALLED) {
++        return 0.0f;
++    }
++    return -1.0f;
++}
++
++FZERO_GPU_HD float fzero_gpu_learner_reward(
++        const FZeroGpuStepResult* result, const FZeroGpuConfig* config,
++        uint32_t episode_frame) {
++    if (result->terminated || result->truncated) {
++        return fzero_gpu_terminal_outcome(
++            result->reason, episode_frame, config->finish_time_target_frames);
++    }
++    return result->raw_reward * config->reward_scale;
++}
++
++FZERO_GPU_HD float fzero_gpu_encode_radius(float radius) {
++    radius = fmaxf(0.0f, radius);
++    return fzero_gpu_clamp_zero_one(radius / (radius + 250.0f));
++}
++
++FZERO_GPU_HD void fzero_gpu_sample_course(const GdxRlCourseSample* samples,
++        const FZeroGpuConfig* config, float distance, FZeroGpuTrackFrame* frame) {
++    float wrapped = fzero_gpu_wrap(distance, config->course_length);
++    float sample_position = wrapped / config->sample_spacing;
++    int index0 = (int)floorf(sample_position);
++    if (index0 >= config->sample_count) {
++        index0 = config->sample_count - 1;
++    }
++    int index1 = index0 + 1;
++    if (index1 == config->sample_count) {
++        index1 = 0;
++    }
++    float t = sample_position - (float)index0;
++    const GdxRlCourseSample* a = &samples[index0];
++    const GdxRlCourseSample* b = &samples[index1];
++
++    frame->position = fzero_gpu_lerp_vec3(a->position, b->position, t);
++    frame->forward = fzero_gpu_normalize(fzero_gpu_lerp_vec3(a->forward, b->forward, t));
++    FZeroGpuVec3 interpolated_up =
++        fzero_gpu_normalize(fzero_gpu_lerp_vec3(a->up, b->up, t));
++    frame->side = fzero_gpu_normalize(fzero_gpu_cross(interpolated_up, frame->forward));
++    frame->up = fzero_gpu_normalize(fzero_gpu_cross(frame->forward, frame->side));
++    frame->radius_left = a->radius_left + (b->radius_left - a->radius_left) * t;
++    frame->radius_right = a->radius_right + (b->radius_right - a->radius_right) * t;
++    const GdxRlCourseSample* nearest = t < 0.5f ? a : b;
++    frame->track_segment_info = nearest->track_segment_info;
++    frame->segment_index = nearest->segment_index;
++}
++
++FZERO_GPU_HD int fzero_gpu_completed_laps(float race_distance, float course_length) {
++    if (race_distance < course_length) {
++        return 1;
++    }
++    return 1 + (int)floorf(race_distance / course_length);
++}
++
++FZERO_GPU_HD void fzero_gpu_reset_state(
++        FZeroGpuState* state, const FZeroGpuConfig* config, uint32_t env_index) {
++    uint32_t next_reset = state->reset_count + 1u;
++    uint32_t reset_seed = config->seed + env_index * 1000003u + state->reset_count;
++    state->race_distance = config->initial_race_distance;
++    state->lap_distance = config->initial_lap_distance;
++    state->lateral = config->initial_lateral;
++    state->vertical = config->initial_vertical;
++    state->yaw = 0.0f;
++    state->speed = config->initial_speed;
++    state->energy = config->initial_energy;
++    state->best_distance = state->race_distance;
++    state->progress_checkpoint = state->race_distance;
++    state->episode_return = 0.0f;
++    state->learner_return = 0.0f;
++    state->episode_frame = 0;
++    state->frames_without_progress = 0;
++    state->episode_decisions = 0;
++    state->boost_timer = 0;
++    state->laps_completed = 1;
++    for (int i = 0; i < GDX_RL_ACTION_SIZE; ++i) {
++        state->previous_action[i] = 0;
++    }
++    for (int i = 0; i < GDX_RL_STEER_BINS; ++i) {
++        state->steer_counts[i] = 0;
++    }
++    for (int i = 0; i < GDX_RL_PITCH_BINS; ++i) {
++        state->pitch_counts[i] = 0;
++    }
++    state->throttle_on_count = 0;
++    state->brake_on_count = 0;
++    state->boost_on_count = 0;
++    state->reset_count = next_reset;
++    state->rng = reset_seed != 0 ? reset_seed : 0xA341316Cu;
++}
++
++FZERO_GPU_HD void fzero_gpu_apply_curriculum(
++        const FZeroGpuConfig* config, int32_t action[GDX_RL_ACTION_SIZE]) {
++    if (!config->steering_curriculum) {
++        return;
++    }
++    action[1] = 0;
++    action[2] = 1;
++    action[3] = 0;
++    action[4] = 0;
++}
++
++FZERO_GPU_HD void fzero_gpu_substep(FZeroGpuState* state,
++        const FZeroGpuConfig* config, const GdxRlCourseSample* samples,
++        const int32_t action[GDX_RL_ACTION_SIZE], int repeat,
++        FZeroGpuStepResult* result) {
++    FZeroGpuTrackFrame old_frame;
++    fzero_gpu_sample_course(samples, config, state->lap_distance, &old_frame);
++
++    const float steer = (float)fzero_gpu_steer_value(action[0]) / 63.0f;
++    state->yaw -= steer * config->steering_rate;
++
++    if (action[2] != 0) {
++        float headroom = fmaxf(0.0f, 1.0f - state->speed / config->engine_target_speed);
++        state->speed += config->engine_acceleration * headroom;
++    }
++    state->speed *= config->forward_drag;
++    if (action[3] != 0) {
++        state->speed *= config->brake_drag;
++    }
++
++    const bool can_boost = state->race_distance >= config->course_length;
++    if (action[4] != 0 && repeat == 0 && state->boost_timer == 0 &&
++            can_boost && state->energy > 0.0f) {
++        state->boost_timer = 100;
++    }
++    if (state->boost_timer > 0) {
++        state->speed = fminf(FZERO_GPU_MAX_SPEED, state->speed + 0.18f);
++        state->energy = fmaxf(0.0f, state->energy - 0.06f);
++        state->boost_timer--;
++    }
++    state->speed = fzero_gpu_clampf(state->speed, 0.0f, FZERO_GPU_MAX_SPEED);
++
++    float forward_delta = state->speed * cosf(state->yaw);
++    float lateral_delta = state->speed * sinf(state->yaw);
++    state->race_distance += forward_delta;
++    state->lap_distance = fzero_gpu_wrap(state->lap_distance + forward_delta, config->course_length);
++    state->lateral += lateral_delta;
++
++    FZeroGpuTrackFrame new_frame;
++    fzero_gpu_sample_course(samples, config, state->lap_distance, &new_frame);
++    float track_turn = atan2f(
++        fzero_gpu_dot(new_frame.forward, old_frame.side),
++        fzero_gpu_dot(new_frame.forward, old_frame.forward));
++    state->yaw -= track_turn;
++    if (state->yaw > 3.14159265358979323846f) {
++        state->yaw -= 6.28318530717958647692f;
++    } else if (state->yaw < -3.14159265358979323846f) {
++        state->yaw += 6.28318530717958647692f;
++    }
++
++    float selected_radius = state->lateral >= 0.0f
++        ? new_frame.radius_left : new_frame.radius_right;
++    float fall_limit = fmaxf(1.0f, selected_radius * config->wall_margin);
++    if (fabsf(state->lateral) > fall_limit) {
++        result->reason = FZERO_GPU_FALLING;
++        result->terminated = 1;
++        result->raw_reward -= 25.0f;
++    }
++
++    state->episode_frame++;
++    result->raw_reward += forward_delta / 1000.0f;
++    int completed_laps = fzero_gpu_completed_laps(state->race_distance, config->course_length);
++    if (completed_laps > state->laps_completed) {
++        result->raw_reward += 2.0f * (float)(completed_laps - state->laps_completed);
++        state->laps_completed = completed_laps;
++    }
++
++    if (!result->terminated && state->race_distance >=
++            config->course_length * (float)config->laps) {
++        result->reason = FZERO_GPU_FINISHED;
++        result->terminated = 1;
++        result->raw_reward += 25.0f;
++    }
++    if (result->terminated) {
++        return;
++    }
++
++    if (state->race_distance > state->best_distance) {
++        state->best_distance = state->race_distance;
++    }
++    if (state->best_distance >= state->progress_checkpoint + config->stall_progress) {
++        state->progress_checkpoint = state->best_distance;
++        state->frames_without_progress = 0;
++    } else {
++        state->frames_without_progress++;
++    }
++    if (state->episode_frame >= (uint32_t)config->max_episode_frames) {
++        result->reason = FZERO_GPU_TIME_LIMIT;
++        result->truncated = 1;
++    } else if (config->stall_frames > 0 &&
++            state->frames_without_progress >= (uint32_t)config->stall_frames) {
++        result->reason = FZERO_GPU_STALLED;
++        result->truncated = 1;
++    }
++}
++
++FZERO_GPU_HD FZeroGpuStepResult fzero_gpu_step_state(FZeroGpuState* state,
++        const FZeroGpuConfig* config, const GdxRlCourseSample* samples,
++        int32_t action[GDX_RL_ACTION_SIZE]) {
++    fzero_gpu_apply_curriculum(config, action);
++    FZeroGpuStepResult result = {};
++    for (int repeat = 0; repeat < config->action_repeat; ++repeat) {
++        fzero_gpu_substep(state, config, samples, action, repeat, &result);
++        if (result.terminated || result.truncated) {
++            break;
++        }
++    }
++    for (int i = 0; i < GDX_RL_ACTION_SIZE; ++i) {
++        state->previous_action[i] = action[i];
++    }
++    state->episode_return += result.raw_reward;
++    result.learner_reward = fzero_gpu_learner_reward(&result, config, state->episode_frame);
++    state->learner_return += result.learner_reward;
++    state->episode_decisions++;
++    state->steer_counts[action[0]]++;
++    state->pitch_counts[action[1]]++;
++    state->throttle_on_count += (uint32_t)action[2];
++    state->brake_on_count += (uint32_t)action[3];
++    state->boost_on_count += (uint32_t)action[4];
++    return result;
++}
++
++template <typename Store>
++FZERO_GPU_HD void fzero_gpu_observe(const FZeroGpuState* state,
++        const FZeroGpuConfig* config, const GdxRlCourseSample* samples,
++        const GdxRlDashPad* dash_pads, Store store) {
++    FZeroGpuTrackFrame current;
++    fzero_gpu_sample_course(samples, config, state->lap_distance, &current);
++    const float cosine = cosf(state->yaw);
++    const float sine = sinf(state->yaw);
++    FZeroGpuVec3 vehicle_forward = fzero_gpu_add(
++        fzero_gpu_scale(current.forward, cosine),
++        fzero_gpu_scale(current.side, sine));
++    FZeroGpuVec3 velocity = fzero_gpu_scale(vehicle_forward, state->speed);
++    FZeroGpuVec3 vehicle_position = fzero_gpu_add(
++        current.position,
++        fzero_gpu_add(fzero_gpu_scale(current.side, state->lateral),
++                      fzero_gpu_scale(current.up, state->vertical)));
++    const float lateral_radius = fmaxf(1.0f, state->lateral >= 0.0f
++        ? current.radius_left : current.radius_right);
++    const float vertical_radius = fmaxf(1.0f, fmaxf(current.radius_left, current.radius_right));
++    const float race_length = config->course_length * (float)config->laps;
++    int index = 0;
++
++    store(index++, fzero_gpu_clamp_unit(fzero_gpu_dot(velocity, current.forward) / FZERO_GPU_MAX_SPEED));
++    store(index++, fzero_gpu_clamp_unit(fzero_gpu_dot(velocity, current.side) / FZERO_GPU_MAX_SPEED));
++    store(index++, fzero_gpu_clamp_unit(fzero_gpu_dot(velocity, current.up) / FZERO_GPU_MAX_SPEED));
++    store(index++, fzero_gpu_clamp_zero_one(state->speed / FZERO_GPU_MAX_SPEED));
++    store(index++, fzero_gpu_clamp_unit(
++        fzero_gpu_clampf(state->lateral / lateral_radius, -1.25f, 1.25f) / 1.25f));
++    store(index++, fzero_gpu_clamp_unit(state->vertical / vertical_radius));
++    store(index++, fzero_gpu_encode_radius(current.radius_left));
++    store(index++, fzero_gpu_encode_radius(current.radius_right));
++
++    store(index++, fzero_gpu_clamp_unit(cosine));
++    store(index++, fzero_gpu_clamp_unit(sine));
++    store(index++, 0.0f);
++    store(index++, 1.0f);
++    store(index++, 0.0f);
++    store(index++, config->max_energy > 0.0f
++        ? fzero_gpu_clamp_zero_one(state->energy / config->max_energy) : 0.0f);
++    store(index++, fzero_gpu_clamp_zero_one((float)state->boost_timer / 100.0f));
++    store(index++, fzero_gpu_clamp_zero_one(state->lap_distance / config->course_length));
++    store(index++, fzero_gpu_clamp_zero_one(state->race_distance / race_length));
++    store(index++, state->race_distance >= config->course_length ? 1.0f : 0.0f);
++    store(index++, 0.0f);
++    store(index++, state->boost_timer > 0 ? 1.0f : 0.0f);
++    store(index++, 0.0f);
++    store(index++, 0.0f);
++    store(index++, 0.0f);
++    store(index++, 0.0f);
++    store(index++, 0.0f);
++    store(index++, 0.0f);
++
++    store(index++, (float)fzero_gpu_steer_value(state->previous_action[0]) / 63.0f);
++    store(index++, (float)fzero_gpu_pitch_value(state->previous_action[1]) / 63.0f);
++    store(index++, (float)state->previous_action[2]);
++    store(index++, (float)state->previous_action[3]);
++    store(index++, (float)state->previous_action[4]);
++
++    for (int lookahead = 0; lookahead < 6; ++lookahead) {
++        const float offset = fzero_gpu_lookahead(lookahead);
++        FZeroGpuTrackFrame future;
++        fzero_gpu_sample_course(samples, config, state->lap_distance + offset, &future);
++        FZeroGpuVec3 displacement = fzero_gpu_sub(future.position, vehicle_position);
++        store(index++, fzero_gpu_clamp_unit(fzero_gpu_dot(displacement, current.forward) / offset));
++        store(index++, fzero_gpu_clamp_unit(fzero_gpu_dot(displacement, current.side) / offset));
++        store(index++, fzero_gpu_clamp_unit(fzero_gpu_dot(displacement, current.up) / offset));
++        store(index++, fzero_gpu_clamp_unit(fzero_gpu_dot(future.forward, current.forward)));
++        store(index++, fzero_gpu_clamp_unit(fzero_gpu_dot(future.forward, current.side)));
++        store(index++, fzero_gpu_clamp_unit(fzero_gpu_dot(future.forward, current.up)));
++        store(index++, fzero_gpu_encode_radius(future.radius_left));
++        store(index++, fzero_gpu_encode_radius(future.radius_right));
++    }
++
++    float nearest_dash[4];
++    fzero_gpu_nearest_dash_observation(
++        state->lap_distance, config, dash_pads, nearest_dash);
++    for (int component = 0; component < 4; ++component) {
++        store(index++, nearest_dash[component]);
++    }
++}
++
++#undef FZERO_GPU_HD
+diff --git a/ocean/fzero/tests/fake_gdiffuser_rl.c b/ocean/fzero/tests/fake_gdiffuser_rl.c
+new file mode 100644
+index 00000000..ef2164af
+--- /dev/null
++++ b/ocean/fzero/tests/fake_gdiffuser_rl.c
+@@ -0,0 +1,133 @@
++#include "gdx_rl_env.h"
++
++#include <math.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <string.h>
++
++const int32_t gdx_rl_action_nvec[GDX_RL_ACTION_SIZE] = {11, 5, 2, 2, 2};
++
++static int initialized;
++static int episode_done;
++static int step_count;
++static uint32_t reset_seed;
++static pthread_t owner_thread;
++static char last_error[256];
++
++static int fail(const char* message) {
++    snprintf(last_error, sizeof(last_error), "%s", message);
++    return -1;
++}
++
++static int check_owner(void) {
++    if (!initialized || !pthread_equal(owner_thread, pthread_self())) {
++        return fail("fake core called from a thread that did not bind");
++    }
++    return 0;
++}
++
++static float reset_observation(uint32_t seed, int index) {
++    return (float)(seed & UINT32_C(0xffff)) / 65535.0f + (float)index * 0.001f;
++}
++
++uint32_t gdx_rl_abi_version(void) {
++    return GDX_RL_ABI_VERSION;
++}
++
++void gdx_rl_default_config(GdxRlConfig* config) {
++    memset(config, 0, sizeof(*config));
++    config->laps = 3;
++    config->action_repeat = 4;
++    config->max_episode_frames = 18000;
++    config->stall_frames = 600;
++    config->stall_progress = 100.0f;
++    config->engine_balance = 0.5f;
++}
++
++int gdx_rl_init(const char* rom_path, const GdxRlConfig* config) {
++    if (initialized) {
++        return fail("fake namespace initialized twice");
++    }
++    if (rom_path == NULL || strcmp(rom_path, "/fake/rom.z64") != 0) {
++        return fail("fake ROM path mismatch");
++    }
++    if (config == NULL || config->action_repeat != 4 || config->laps != 1) {
++        return fail("fake config mismatch");
++    }
++    initialized = 1;
++    owner_thread = pthread_self();
++    return 0;
++}
++
++int gdx_rl_bind_thread(void) {
++    if (!initialized) {
++        return fail("bind before init");
++    }
++    owner_thread = pthread_self();
++    return 0;
++}
++
++int gdx_rl_reset(uint32_t seed, float observation[GDX_RL_OBSERVATION_SIZE]) {
++    if (check_owner() != 0) {
++        return -1;
++    }
++    if (observation == NULL) {
++        return fail("null reset observation");
++    }
++    reset_seed = seed;
++    step_count = 0;
++    episode_done = 0;
++    for (int i = 0; i < GDX_RL_OBSERVATION_SIZE; ++i) {
++        observation[i] = reset_observation(seed, i);
++    }
++    return 0;
++}
++
++int gdx_rl_step(const int32_t action[GDX_RL_ACTION_SIZE],
++        float observation[GDX_RL_OBSERVATION_SIZE], GdxRlTransition* transition) {
++    if (check_owner() != 0) {
++        return -1;
++    }
++    if (action == NULL || observation == NULL || transition == NULL) {
++        return fail("null step argument");
++    }
++    if (episode_done) {
++        return fail("step after terminal without reset");
++    }
++    for (int i = 0; i < GDX_RL_ACTION_SIZE; ++i) {
++        if (action[i] < 0 || action[i] >= gdx_rl_action_nvec[i]) {
++            return fail("out-of-range action reached fake core");
++        }
++    }
++
++    step_count += 1;
++    for (int i = 0; i < GDX_RL_OBSERVATION_SIZE; ++i) {
++        observation[i] = (float)(10 * step_count + i);
++    }
++    memset(transition, 0, sizeof(*transition));
++    transition->reward = step_count == 1 ? 1.25f : 7.0f;
++    transition->race_distance = 100.0f * (float)step_count;
++    transition->speed = 40.0f + 5.0f * (float)step_count;
++    transition->energy_fraction = 0.75f;
++    transition->semantic_hash = ((uint64_t)reset_seed << 32) | (uint32_t)step_count;
++    transition->episode_frame = (uint32_t)(4 * step_count);
++    transition->lap = 1;
++    transition->dash_pad_hits = step_count == 1 ? 1 : 0;
++    if (step_count == 2) {
++        transition->terminated = 1;
++        transition->reason = GDX_RL_FINISHED;
++        episode_done = 1;
++    }
++    return 0;
++}
++
++uint64_t gdx_rl_semantic_hash(void) {
++    if (check_owner() != 0) {
++        return 0;
++    }
++    return ((uint64_t)reset_seed << 32) | (uint32_t)step_count;
++}
++
++const char* gdx_rl_last_error(void) {
++    return last_error;
++}
+diff --git a/ocean/fzero/tests/run_all.sh b/ocean/fzero/tests/run_all.sh
+new file mode 100755
+index 00000000..e6612d45
+--- /dev/null
++++ b/ocean/fzero/tests/run_all.sh
+@@ -0,0 +1,42 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++cd "$(dirname "$0")/../../.."
++
++test_dir=build/fzero-tests
++mkdir -p "$test_dir"
++
++cc -std=c11 -O2 -Wall -Wextra -fPIC -shared -pthread \
++    -I../G-Diffuser/port/rl \
++    ocean/fzero/tests/fake_gdiffuser_rl.c \
++    -o "$test_dir/libfake_gdiffuser_rl.so"
++
++cc -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE \
++    -I. -Isrc -Iocean/fzero -Ivendor \
++    -Iraylib-5.5_linux_amd64/include \
++    ocean/fzero/tests/test_fzero_adapter.c \
++    raylib-5.5_linux_amd64/lib/libraylib.a \
++    -ldl -lGL -lm -lpthread \
++    -o "$test_dir/test_fzero_adapter"
++
++"$test_dir/test_fzero_adapter" \
++    "$test_dir/libfake_gdiffuser_rl.so" \
++    "$test_dir/fzero-render-eval-input.txt"
++
++if [[ "${FZERO_TEST_REAL_CORE:-0}" == 1 ]]; then
++    c++ -std=c++17 -O2 -Wall -Wextra \
++        -I. -Isrc -Iocean/fzero -Ivendor \
++        ocean/fzero/tests/test_fzero_gpu_core.cpp \
++        ../G-Diffuser/build/rl-headless/port/libgdiffuser_rl.so \
++        -Wl,-rpath,"$PWD/../G-Diffuser/build/rl-headless/port" \
++        -ldl -lm -lpthread \
++        -o "$test_dir/test_fzero_gpu_core"
++    "$test_dir/test_fzero_gpu_core" \
++        "${FZEROX_ROM:-../private/baserom.us.rev0.z64}"
++
++    ./build.sh fzero "$test_dir/fzero-cpu" --cpu
++    # Explicitly disable the forced-throttle curriculum: this is the true
++    # zero-action baseline and intentionally runs without a policy checkpoint.
++    "$test_dir/fzero-cpu" --headless --base.eval_episodes=1 \
++        --env.steering_curriculum=0
++fi
+diff --git a/ocean/fzero/tests/test_fzero_adapter.c b/ocean/fzero/tests/test_fzero_adapter.c
+new file mode 100644
+index 00000000..ba9cf18c
+--- /dev/null
++++ b/ocean/fzero/tests/test_fzero_adapter.c
+@@ -0,0 +1,339 @@
++#include <math.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../fzero.h"
++
++#define CHECK(condition) do { \
++    if (!(condition)) { \
++        fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition); \
++        exit(EXIT_FAILURE); \
++    } \
++} while (0)
++
++#define CHECK_NEAR(actual, expected, tolerance) do { \
++    float check_actual = (float)(actual); \
++    float check_expected = (float)(expected); \
++    if (fabsf(check_actual - check_expected) > (tolerance)) { \
++        fprintf(stderr, "%s:%d: expected %.9g, got %.9g\n", \
++            __FILE__, __LINE__, check_expected, check_actual); \
++        exit(EXIT_FAILURE); \
++    } \
++} while (0)
++
++static void set_config(Dict* kwargs, const char* core_path) {
++    kwargs->name = dict_strdup("env");
++    dict_set_str(kwargs, "core_lib_path", core_path);
++    dict_set_str(kwargs, "rom_path", "/fake/rom.z64");
++    dict_set(kwargs, "seed", 100.0);
++    dict_set(kwargs, "course_index", 0.0);
++    dict_set(kwargs, "character", 0.0);
++    dict_set(kwargs, "machine_skin", 0.0);
++    dict_set(kwargs, "laps", 1.0);
++    dict_set(kwargs, "action_repeat", 4.0);
++    dict_set(kwargs, "max_episode_frames", 1000.0);
++    dict_set(kwargs, "stall_frames", 100.0);
++    dict_set(kwargs, "stall_progress", 1.0);
++    dict_set(kwargs, "engine_balance", 0.5);
++    dict_set(kwargs, "cpu_oracle", 0.0);
++    dict_set(kwargs, "steering_curriculum", 1.0);
++    dict_set(kwargs, "reward_scale", 0.03125);
++    dict_set(kwargs, "finish_time_target_frames", 0.0);
++    dict_set(kwargs, "dash_hit_reward", 0.1);
++}
++
++static void test_action_validation(void) {
++    int action_sizes[] = ACT_SIZES;
++    CHECK(sizeof(action_sizes) / sizeof(action_sizes[0]) == GDX_RL_ACTION_SIZE);
++    for (int i = 0; i < GDX_RL_ACTION_SIZE; ++i) {
++        CHECK(action_sizes[i] == FZERO_ACTION_NVECS[i]);
++    }
++
++    float raw[GDX_RL_ACTION_SIZE] = {10.0f, 4.0f, 1.0f, 1.0f, 1.0f};
++    int32_t decoded[GDX_RL_ACTION_SIZE] = {0};
++    CHECK(fzero_decode_actions(raw, decoded) == 0);
++    for (int i = 0; i < GDX_RL_ACTION_SIZE; ++i) {
++        CHECK(decoded[i] == (int32_t)raw[i]);
++    }
++
++    raw[0] = NAN;
++    CHECK(fzero_decode_actions(raw, decoded) == 1);
++    raw[0] = 0.0f;
++    raw[1] = 2.5f;
++    CHECK(fzero_decode_actions(raw, decoded) == 2);
++    raw[1] = 0.0f;
++    raw[4] = 2.0f;
++    CHECK(fzero_decode_actions(raw, decoded) == 5);
++    raw[4] = 0.0f;
++    raw[0] = -1.0f;
++    CHECK(fzero_decode_actions(raw, decoded) == 1);
++
++    float scaled = 0.0f;
++    CHECK(fzero_scale_reward(8.25f, 0.03125f, &scaled) == 0);
++    CHECK_NEAR(scaled, 8.25f / 32.0f, 0.0f);
++    CHECK(fzero_scale_reward(32.0f, 0.03125f, &scaled) == 0);
++    CHECK_NEAR(scaled, 1.0f, 0.0f);
++    CHECK(fzero_scale_reward(32.01f, 0.03125f, &scaled) != 0);
++    CHECK(fzero_scale_reward(NAN, 0.03125f, &scaled) != 0);
++
++    GdxRlTransition transition = {0};
++    transition.reason = GDX_RL_FINISHED;
++    transition.episode_frame = 8;
++    CHECK_NEAR(fzero_completed_lap_score(0.0f, 8), 1.0f, 0.0f);
++    CHECK_NEAR(fzero_completed_lap_score(2000.0f, 1000), 1.0f, 0.0f);
++    CHECK_NEAR(fzero_completed_lap_score(2000.0f, 2000), 1.0f, 0.0f);
++    CHECK_NEAR(fzero_completed_lap_score(2000.0f, 2241),
++        2000.0f / 2241.0f, 0.0f);
++    CHECK_NEAR(fzero_completed_lap_score(2000.0f, 2500), 0.8f, 1e-7f);
++    CHECK(fzero_completed_lap_score(2000.0f, 2141) >
++        fzero_completed_lap_score(2000.0f, 2241));
++
++    float learner_reward = 0.0f;
++    transition.episode_frame = 2241;
++    CHECK(fzero_compute_learner_reward(27.5f, &transition,
++        0.03125f, 2000.0f, &learner_reward) == 0);
++    CHECK_NEAR(learner_reward, 2000.0f / 2241.0f, 0.0f);
++    transition.episode_frame = 8;
++    CHECK(fzero_compute_learner_reward(27.5f, &transition,
++        0.03125f, 0.0f, &learner_reward) == 0);
++    CHECK_NEAR(learner_reward, 1.0f, 0.0f);
++    CHECK(fzero_compute_learner_reward(NAN, &transition,
++        0.03125f, 0.0f, &learner_reward) != 0);
++
++    const uint8_t fatal_reasons[] = {
++        GDX_RL_SPINNING_OUT,
++        GDX_RL_FALLING,
++        GDX_RL_CRASHED,
++        GDX_RL_RETIRED,
++    };
++    for (size_t i = 0; i < sizeof(fatal_reasons) / sizeof(fatal_reasons[0]); ++i) {
++        transition.reason = fatal_reasons[i];
++        CHECK(fzero_compute_learner_reward(31.0f, &transition,
++            0.03125f, 2000.0f, &learner_reward) == 0);
++        CHECK_NEAR(learner_reward, -1.0f, 0.0f);
++    }
++    transition.reason = GDX_RL_TIME_LIMIT;
++    CHECK(fzero_compute_learner_reward(31.0f, &transition,
++        0.03125f, 2000.0f, &learner_reward) == 0);
++    CHECK_NEAR(learner_reward, 0.0f, 0.0f);
++    transition.reason = GDX_RL_STALLED;
++    CHECK(fzero_compute_learner_reward(-31.0f, &transition,
++        0.03125f, 2000.0f, &learner_reward) == 0);
++    CHECK_NEAR(learner_reward, 0.0f, 0.0f);
++    transition.reason = GDX_RL_RUNNING;
++    CHECK(fzero_compute_learner_reward(1.25f, &transition,
++        0.03125f, 2000.0f, &learner_reward) == 0);
++    CHECK_NEAR(learner_reward, 1.25f / 32.0f, 0.0f);
++
++    transition.dash_pad_hits = 1;
++    CHECK_NEAR(fzero_shape_dash_reward(1.25f, &transition, 0.1f),
++        1.35f, 1e-7f);
++    CHECK_NEAR(fzero_shape_dash_reward(1.25f, &transition, 0.0f),
++        1.25f, 0.0f);
++    transition.dash_pad_hits = 2;
++    CHECK_NEAR(fzero_shape_dash_reward(1.25f, &transition, 0.1f),
++        1.45f, 1e-7f);
++
++    FZero log_env = {0};
++    log_env.finish_time_target_frames = 2000.0f;
++    log_env.episode_return = 123.0f;
++    transition.reason = GDX_RL_FINISHED;
++    transition.episode_frame = 2241;
++    fzero_add_log(&log_env, &transition);
++    CHECK_NEAR(log_env.log.score, 2000.0f / 2241.0f, 0.0f);
++    CHECK_NEAR(log_env.log.perf, 2000.0f / 2241.0f, 0.0f);
++    CHECK_NEAR(log_env.log.episode_return, 123.0f, 0.0f);
++
++    memset(&log_env, 0, sizeof(log_env));
++    log_env.finish_time_target_frames = 2000.0f;
++    transition.reason = GDX_RL_CRASHED;
++    fzero_add_log(&log_env, &transition);
++    CHECK_NEAR(log_env.log.score, -1.0f, 0.0f);
++    CHECK_NEAR(log_env.log.perf, -1.0f, 0.0f);
++
++    memset(&log_env, 0, sizeof(log_env));
++    log_env.finish_time_target_frames = 2000.0f;
++    transition.reason = GDX_RL_STALLED;
++    fzero_add_log(&log_env, &transition);
++    CHECK_NEAR(log_env.log.score, 0.0f, 0.0f);
++    CHECK_NEAR(log_env.log.perf, 0.0f, 0.0f);
++}
++
++static void* step_on_puffer_worker(void* argument) {
++    puf_step((FZero*)argument);
++    return NULL;
++}
++
++static float expected_reset_observation(uint32_t seed, int index) {
++    return (float)(seed & UINT32_C(0xffff)) / 65535.0f + (float)index * 0.001f;
++}
++
++static char* read_stream(FILE* file) {
++    CHECK(file != NULL);
++    CHECK(fseek(file, 0, SEEK_END) == 0);
++    long size = ftell(file);
++    CHECK(size >= 0);
++    CHECK(fseek(file, 0, SEEK_SET) == 0);
++    char* text = (char*)calloc((size_t)size + 1, 1);
++    CHECK(text != NULL);
++    CHECK(fread(text, 1, (size_t)size, file) == (size_t)size);
++    return text;
++}
++
++static char* read_path(const char* path) {
++    FILE* file = fopen(path, "rb");
++    CHECK(file != NULL);
++    char* text = read_stream(file);
++    CHECK(fclose(file) == 0);
++    return text;
++}
++
++static void test_gdx_action_encoding(void) {
++    FILE* file = tmpfile();
++    CHECK(file != NULL);
++    const int32_t boost_action[GDX_RL_ACTION_SIZE] = {10, 4, 1, 1, 1};
++    CHECK(fzero_gdx_write_action(file, 7, 4, boost_action) == 0);
++    char* text = read_stream(file);
++    CHECK(strcmp(text,
++        "# decision 7 action 10 4 1 1 1\n"
++        "INPUT A+CDOWN+B 63 63 1\n"
++        "INPUT A+CDOWN 63 63 3\n") == 0);
++    free(text);
++    CHECK(fclose(file) == 0);
++
++    file = tmpfile();
++    CHECK(file != NULL);
++    const int32_t neutral_buttons[GDX_RL_ACTION_SIZE] = {1, 1, 0, 0, 0};
++    CHECK(fzero_gdx_write_action(file, 8, 4, neutral_buttons) == 0);
++    text = read_stream(file);
++    CHECK(strcmp(text,
++        "# decision 8 action 1 1 0 0 0\n"
++        "INPUT - -13 -32 4\n") == 0);
++    free(text);
++    CHECK(fclose(file) == 0);
++}
++
++static void test_thread_handoff_and_autoreset(
++        const char* core_path, const char* trace_path) {
++    Dict kwargs = {0};
++    set_config(&kwargs, core_path);
++
++    FZero env;
++    memset(&env, 0, sizeof(env));
++    env.rng = 5;
++    puf_init(&env, &kwargs);
++
++    float observations[GDX_RL_OBSERVATION_SIZE] = {0};
++    float actions[GDX_RL_ACTION_SIZE] = {10.0f, 0.0f, 1.0f, 0.0f, 0.0f};
++    float reward = 0.0f;
++    float terminal = 0.0f;
++    unsigned char action_mask[FZERO_ACTION_MASK_SIZE] = {0};
++    env.agents[0].observations = observations;
++    env.agents[0].actions = actions;
++    env.agents[0].rewards = &reward;
++    env.agents[0].terminals = &terminal;
++    env.agents[0].action_mask = action_mask;
++
++    puf_reset(&env);
++    for (int category = 0; category < GDX_RL_STEER_BINS; ++category) {
++        CHECK(action_mask[FZERO_STEER_MASK_OFFSET + category] == 1);
++    }
++    CHECK(action_mask[FZERO_PITCH_MASK_OFFSET] == 1);
++    CHECK(action_mask[FZERO_PITCH_MASK_OFFSET + 1] == 0);
++    CHECK(action_mask[FZERO_THROTTLE_MASK_OFFSET] == 0);
++    CHECK(action_mask[FZERO_THROTTLE_MASK_OFFSET + 1] == 1);
++    CHECK(action_mask[FZERO_BRAKE_MASK_OFFSET] == 1);
++    CHECK(action_mask[FZERO_BRAKE_MASK_OFFSET + 1] == 0);
++    CHECK(action_mask[FZERO_BOOST_MASK_OFFSET] == 1);
++    CHECK(action_mask[FZERO_BOOST_MASK_OFFSET + 1] == 0);
++    uint32_t first_seed = UINT32_C(100) + UINT32_C(5) * UINT32_C(1000003);
++    CHECK(env.last_reset_seed == first_seed);
++    CHECK_NEAR(observations[0], expected_reset_observation(first_seed, 0), 1e-7f);
++    fzero_gdx_input_trace_open(
++        &env, trace_path, "/fake/checkpoint.bin", UINT32_C(1));
++
++    /* This is the same setup -> Puffer worker handoff used by src/pufferl.cu. */
++    pthread_t worker;
++    CHECK(pthread_create(&worker, NULL, step_on_puffer_worker, &env) == 0);
++    CHECK(pthread_join(worker, NULL) == 0);
++    CHECK_NEAR(reward, 1.35f / 32.0f, 1e-7f);
++    CHECK_NEAR(terminal, 0.0f, 0.0f);
++    CHECK_NEAR(observations[0], 10.0f, 0.0f);
++    CHECK(env.episode_decisions == 1);
++
++    /* Moving back to main exercises a second bind. This step terminates; the
++     * adapter must preserve reward/terminal while exposing reset observation. */
++    puf_step(&env);
++    uint32_t second_seed = first_seed + UINT32_C(1);
++    CHECK(env.last_reset_seed == second_seed);
++    CHECK_NEAR(reward, 1.0f, 0.0f);
++    CHECK_NEAR(terminal, 1.0f, 0.0f);
++    CHECK_NEAR(observations[0], expected_reset_observation(second_seed, 0), 1e-7f);
++    CHECK(env.last_transition.terminated == 1);
++    CHECK(env.last_transition.reason == GDX_RL_FINISHED);
++    CHECK(env.boundary_reached == 1);
++    CHECK_NEAR(env.log.n, 1.0f, 0.0f);
++    CHECK_NEAR(env.log.perf, 1.0f, 0.0f);
++    CHECK_NEAR(env.log.score, 1.0f, 0.0f);
++    CHECK_NEAR(env.log.episode_return, 8.35f, 1e-6f);
++    CHECK_NEAR(env.log.learner_return, 1.0f + 1.35f / 32.0f, 1e-7f);
++    CHECK_NEAR(env.log.episode_length, 2.0f, 0.0f);
++    CHECK_NEAR(env.log.episode_frames, 8.0f, 0.0f);
++    CHECK_NEAR(env.log.finish_frames, 8.0f, 0.0f);
++    CHECK_NEAR(env.log.dash_hits, 1.0f, 0.0f);
++    CHECK_NEAR(env.log.race_distance, 200.0f, 0.0f);
++    CHECK_NEAR(env.log.finish_rate, 1.0f, 0.0f);
++    CHECK_NEAR(env.log.terminated_rate, 1.0f, 0.0f);
++    CHECK_NEAR(env.log.truncated_rate, 0.0f, 0.0f);
++    CHECK_NEAR(env.log.steer_fraction[10], 1.0f, 0.0f);
++    CHECK_NEAR(env.log.pitch_fraction[0], 1.0f, 0.0f);
++    CHECK_NEAR(env.log.throttle_on_fraction, 1.0f, 0.0f);
++    CHECK_NEAR(env.log.brake_on_fraction, 0.0f, 0.0f);
++    CHECK_NEAR(env.log.boost_on_fraction, 0.0f, 0.0f);
++    CHECK(fzero_gdx_input_trace_complete(&env));
++    CHECK(env.gdx_input_trace->decisions == 2);
++
++    char* trace = read_path(trace_path);
++    CHECK(strstr(trace, "# environment_seed 5000115\n") != NULL);
++    CHECK(strstr(trace, "# sampler_seed 1\n") != NULL);
++    CHECK(strstr(trace, "# decision 0 action 10 0 1 0 0\nINPUT A 63 0 4\n") != NULL);
++    CHECK(strstr(trace, "# decision 1 action 10 0 1 0 0\nINPUT A 63 0 4\n") != NULL);
++    CHECK(strstr(trace, "# result decisions 2 raw_score 8.35000038 reason 1") != NULL);
++    CHECK(strstr(trace,
++        "LOG Puffer policy trace exhausted; waiting for rendered terminal\n"
++        "WAIT 120\nSHOT puffer-fzero-finish\nWAIT 2\nQUIT\n") != NULL);
++    free(trace);
++
++    Dict output = {0};
++    puf_log(&env.log, &output);
++    CHECK_NEAR(dict_get(&output, "perf"), 1.0f, 0.0f);
++    CHECK_NEAR(dict_get(&output, "score"), 1.0f, 0.0f);
++    CHECK_NEAR(dict_get(&output, "learner_return"),
++        1.0f + 1.35f / 32.0f, 1e-7f);
++    CHECK_NEAR(dict_get(&output, "finish_rate"), 1.0f, 0.0f);
++    CHECK_NEAR(dict_get(&output, "episode_frames"), 8.0f, 0.0f);
++    CHECK_NEAR(dict_get(&output, "finish_frames"), 8.0f, 0.0f);
++    CHECK_NEAR(dict_get(&output, "dash_hits"), 1.0f, 0.0f);
++    CHECK_NEAR(dict_get(&output, "steer_10_fraction"), 1.0f, 0.0f);
++    CHECK_NEAR(dict_get(&output, "throttle_on_fraction"), 1.0f, 0.0f);
++
++    dict_clear(&output);
++    puf_close(&env);
++    dict_clear(&kwargs);
++}
++
++int main(int argc, char** argv) {
++    if (argc != 3) {
++        fprintf(stderr,
++            "usage: %s <fake-libgdiffuser_rl.so> <trace-output.txt>\n", argv[0]);
++        return 2;
++    }
++    test_action_validation();
++    test_gdx_action_encoding();
++    test_thread_handoff_and_autoreset(argv[1], argv[2]);
++    puts("FZERO_ADAPTER_TEST_OK actions=5 worker_handoff=1 autoreset=1 gdx_trace=1");
++    return 0;
++}
+diff --git a/ocean/fzero/tests/test_fzero_gpu_core.cpp b/ocean/fzero/tests/test_fzero_gpu_core.cpp
+new file mode 100644
+index 00000000..4e866a4b
+--- /dev/null
++++ b/ocean/fzero/tests/test_fzero_gpu_core.cpp
+@@ -0,0 +1,349 @@
++#include <algorithm>
++#include <cstddef>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++#include "../fzero_gpu_core.cuh"
++
++#define CHECK(condition) do { \
++    if (!(condition)) { \
++        std::fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition); \
++        std::exit(EXIT_FAILURE); \
++    } \
++} while (0)
++
++#define CHECK_NEAR(actual, expected, tolerance) do { \
++    float check_actual = (float)(actual); \
++    float check_expected = (float)(expected); \
++    if (std::fabs(check_actual - check_expected) > (tolerance)) { \
++        std::fprintf(stderr, "%s:%d: expected %.9g, got %.9g\n", \
++            __FILE__, __LINE__, check_expected, check_actual); \
++        std::exit(EXIT_FAILURE); \
++    } \
++} while (0)
++
++static_assert(GDX_RL_MAX_DASH_PADS == 192, "GPU dash-pad capacity must match the core");
++static_assert(GDX_RL_OBSERVATION_SIZE == 83, "GPU observation ABI must include dash-pad fields");
++static_assert(sizeof(GdxRlDashPad) == 16, "dash-pad export must remain a compact POD");
++static_assert(offsetof(GdxRlDashPad, entry_distance) == 0, "unexpected dash-pad layout");
++static_assert(offsetof(GdxRlDashPad, target) == 4, "unexpected dash-pad layout");
++static_assert(offsetof(GdxRlDashPad, width) == 8, "unexpected dash-pad layout");
++static_assert(offsetof(GdxRlDashPad, segment_index) == 12, "unexpected dash-pad layout");
++
++namespace {
++
++struct ObservationStore {
++    float* values;
++    int* count;
++
++    void operator()(int index, float value) const {
++        CHECK(index == *count);
++        CHECK(std::isfinite(value));
++        CHECK(value >= -1.00001f && value <= 1.00001f);
++        values[index] = value;
++        *count = index + 1;
++    }
++};
++
++void observe(const FZeroGpuState& state, const FZeroGpuConfig& config,
++        const std::vector<GdxRlCourseSample>& course,
++        const std::vector<GdxRlDashPad>& dash_pads,
++        float values[GDX_RL_OBSERVATION_SIZE]) {
++    int count = 0;
++    fzero_gpu_observe(&state, &config, course.data(),
++        dash_pads.empty() ? nullptr : dash_pads.data(), ObservationStore{values, &count});
++    CHECK(count == GDX_RL_OBSERVATION_SIZE);
++}
++
++void test_dash_observation_boundaries(void) {
++    FZeroGpuConfig config = {};
++    config.course_length = 1000.0f;
++    float output[4] = {};
++
++    fzero_gpu_nearest_dash_observation(50.0f, &config, nullptr, output);
++    for (float value : output) {
++        CHECK_NEAR(value, 0.0f, 0.0f);
++    }
++
++    const GdxRlDashPad pads[] = {
++        {100.0f, -0.5f, 0.25f, 3},
++        {400.0f, 0.75f, 0.5f, 7},
++    };
++    config.dash_pad_count = 2;
++
++    fzero_gpu_nearest_dash_observation(50.0f, &config, pads, output);
++    CHECK_NEAR(output[0], 1.0f, 0.0f);
++    CHECK_NEAR(output[1], 50.0f / 8000.0f, 1e-7f);
++    CHECK_NEAR(output[2], -0.5f, 0.0f);
++    CHECK_NEAR(output[3], 0.25f, 0.0f);
++
++    fzero_gpu_nearest_dash_observation(100.0f, &config, pads, output);
++    CHECK_NEAR(output[1], 0.0f, 0.0f);
++    CHECK_NEAR(output[2], -0.5f, 0.0f);
++
++    fzero_gpu_nearest_dash_observation(100.25f, &config, pads, output);
++    CHECK_NEAR(output[1], 299.75f / 8000.0f, 1e-7f);
++    CHECK_NEAR(output[2], 0.75f, 0.0f);
++    CHECK_NEAR(output[3], 0.5f, 0.0f);
++
++    fzero_gpu_nearest_dash_observation(400.25f, &config, pads, output);
++    CHECK_NEAR(output[1], 699.75f / 8000.0f, 1e-7f);
++    CHECK_NEAR(output[2], -0.5f, 0.0f);
++
++    fzero_gpu_nearest_dash_observation(-50.0f, &config, pads, output);
++    CHECK_NEAR(output[1], 150.0f / 8000.0f, 1e-7f);
++
++    const GdxRlDashPad distant = {9000.0f, 0.0f, 1.0f, 0};
++    config.course_length = 20000.0f;
++    config.dash_pad_count = 1;
++    fzero_gpu_nearest_dash_observation(0.0f, &config, &distant, output);
++    CHECK_NEAR(output[1], 1.0f, 0.0f);
++}
++
++void test_learner_outcome_boundaries(void) {
++    FZeroGpuConfig config = {};
++    config.reward_scale = 0.03125f;
++    config.finish_time_target_frames = 2000.0f;
++    FZeroGpuStepResult result = {};
++    result.raw_reward = 4.0f;
++    CHECK_NEAR(fzero_gpu_learner_reward(&result, &config, 100), 0.125f, 0.0f);
++
++    result.terminated = 1;
++    result.reason = FZERO_GPU_FINISHED;
++    CHECK_NEAR(fzero_gpu_learner_reward(&result, &config, 1000), 1.0f, 0.0f);
++    CHECK_NEAR(fzero_gpu_learner_reward(&result, &config, 2000), 1.0f, 0.0f);
++    CHECK_NEAR(fzero_gpu_learner_reward(&result, &config, 2500), 0.8f, 1e-7f);
++    config.finish_time_target_frames = 0.0f;
++    CHECK_NEAR(fzero_gpu_learner_reward(&result, &config, 2500), 1.0f, 0.0f);
++    config.finish_time_target_frames = 2000.0f;
++
++    const int fatal_reasons[] = {
++        FZERO_GPU_SPINNING_OUT,
++        FZERO_GPU_FALLING,
++        FZERO_GPU_CRASHED,
++        FZERO_GPU_RETIRED,
++    };
++    for (int reason : fatal_reasons) {
++        result.reason = reason;
++        CHECK_NEAR(fzero_gpu_learner_reward(&result, &config, 2500), -1.0f, 0.0f);
++    }
++
++    result.terminated = 0;
++    result.truncated = 1;
++    result.reason = FZERO_GPU_TIME_LIMIT;
++    CHECK_NEAR(fzero_gpu_learner_reward(&result, &config, 2500), 0.0f, 0.0f);
++    result.reason = FZERO_GPU_STALLED;
++    CHECK_NEAR(fzero_gpu_learner_reward(&result, &config, 2500), 0.0f, 0.0f);
++}
++
++int nearest_steer_category(float desired) {
++    int best_category = 0;
++    float best_error = std::fabs(desired);
++    for (int category = 1; category < GDX_RL_STEER_BINS; ++category) {
++        float error = std::fabs(desired - (float)fzero_gpu_steer_value(category));
++        if (error < best_error) {
++            best_error = error;
++            best_category = category;
++        }
++    }
++    return best_category;
++}
++
++FZeroGpuConfig make_config(const GdxRlConfig& oracle,
++        const GdxRlCourseMetadata& metadata, const GdxRlReferenceState& reference) {
++    FZeroGpuConfig config = {};
++    config.sample_count = (int32_t)metadata.sample_count;
++    config.dash_pad_count = (int32_t)metadata.dash_pad_count;
++    config.laps = oracle.laps;
++    config.action_repeat = oracle.action_repeat;
++    config.max_episode_frames = oracle.max_episode_frames;
++    config.stall_frames = oracle.stall_frames;
++    config.steering_curriculum = 1;
++    config.course_length = metadata.length;
++    config.sample_spacing = metadata.sample_spacing;
++    config.stall_progress = oracle.stall_progress;
++    config.reward_scale = 0.03125f;
++    config.finish_time_target_frames = 2000.0f;
++    config.engine_target_speed = 60.0f;
++    config.engine_acceleration = 0.25f;
++    config.forward_drag = 0.997f;
++    config.brake_drag = 0.987f;
++    config.steering_rate = 0.032f;
++    config.wall_margin = 1.0f;
++    config.initial_race_distance = reference.race_distance;
++    config.initial_lap_distance = reference.lap_distance;
++    config.initial_lateral = reference.lateral;
++    config.initial_vertical = reference.vertical;
++    config.initial_speed = reference.speed;
++    config.initial_energy = reference.energy;
++    config.max_energy = reference.max_energy;
++    config.seed = 73;
++    return config;
++}
++
++} // namespace
++
++int main(int argc, char** argv) {
++    if (argc != 2) {
++        std::fprintf(stderr, "usage: %s <baserom.us.rev0.z64>\n", argv[0]);
++        return 2;
++    }
++
++    test_dash_observation_boundaries();
++    test_learner_outcome_boundaries();
++
++    GdxRlConfig oracle;
++    gdx_rl_default_config(&oracle);
++    oracle.course_index = 0;
++    oracle.character = 0;
++    oracle.machine_skin = 0;
++    oracle.laps = 1;
++    oracle.action_repeat = 4;
++    oracle.max_episode_frames = 9000;
++    oracle.stall_frames = 600;
++    oracle.stall_progress = 100.0f;
++    oracle.engine_balance = 0.5f;
++    oracle.cpu_oracle = 1;
++    CHECK(gdx_rl_init(argv[1], &oracle) == 0);
++
++    float oracle_initial[GDX_RL_OBSERVATION_SIZE] = {};
++    CHECK(gdx_rl_reset(73, oracle_initial) == 0);
++    constexpr uint32_t kSampleCount = 4096;
++    std::vector<GdxRlCourseSample> course(kSampleCount);
++    GdxRlCourseMetadata metadata = {};
++    GdxRlReferenceState reference = {};
++    CHECK(gdx_rl_export_course(kSampleCount, course.data(), &metadata) == 0);
++    CHECK(metadata.version == GDX_RL_COURSE_EXPORT_VERSION);
++    CHECK(metadata.dash_pad_count <= GDX_RL_MAX_DASH_PADS);
++    uint32_t queried_dash_pad_count = UINT32_MAX;
++    CHECK(gdx_rl_export_dash_pads(0, nullptr, &queried_dash_pad_count) == 0);
++    CHECK(queried_dash_pad_count == metadata.dash_pad_count);
++    std::vector<GdxRlDashPad> dash_pads(GDX_RL_MAX_DASH_PADS);
++    uint32_t dash_pad_count = 0;
++    CHECK(gdx_rl_export_dash_pads(GDX_RL_MAX_DASH_PADS,
++        dash_pads.data(), &dash_pad_count) == 0);
++    CHECK(dash_pad_count == metadata.dash_pad_count);
++    CHECK(dash_pad_count > 0);
++    dash_pads.resize(dash_pad_count);
++    CHECK(gdx_rl_export_reference_state(&reference) == 0);
++    FZeroGpuConfig config = make_config(oracle, metadata, reference);
++
++    FZeroGpuState first = {};
++    FZeroGpuState second = {};
++    fzero_gpu_reset_state(&first, &config, 17);
++    fzero_gpu_reset_state(&second, &config, 17);
++    CHECK(std::memcmp(&first, &second, sizeof(first)) == 0);
++
++    float reduced_initial[GDX_RL_OBSERVATION_SIZE] = {};
++    observe(first, config, course, dash_pads, reduced_initial);
++    float initial_max_error = 0.0f;
++    for (int i = 0; i < GDX_RL_OBSERVATION_SIZE; ++i) {
++        initial_max_error = std::max(initial_max_error,
++            std::fabs(reduced_initial[i] - oracle_initial[i]));
++    }
++    CHECK(initial_max_error < 0.01f);
++
++    float dash_observation_max_error = 0.0f;
++    float oracle_observation[GDX_RL_OBSERVATION_SIZE] = {};
++    GdxRlTransition oracle_transition = {};
++    const int32_t neutral_action[GDX_RL_ACTION_SIZE] = {};
++    int oracle_decisions = 0;
++    while (!oracle_transition.terminated && !oracle_transition.truncated &&
++            oracle_decisions < 5000) {
++        CHECK(gdx_rl_step(neutral_action, oracle_observation, &oracle_transition) == 0);
++        GdxRlReferenceState live_reference = {};
++        CHECK(gdx_rl_export_reference_state(&live_reference) == 0);
++        FZeroGpuState query = first;
++        query.lap_distance = live_reference.lap_distance;
++        float query_observation[GDX_RL_OBSERVATION_SIZE] = {};
++        observe(query, config, course, dash_pads, query_observation);
++        for (int i = 79; i < 83; ++i) {
++            dash_observation_max_error = std::max(dash_observation_max_error,
++                std::fabs(query_observation[i] - oracle_observation[i]));
++        }
++        oracle_decisions++;
++    }
++    CHECK(oracle_transition.terminated);
++    CHECK(oracle_transition.reason == GDX_RL_FINISHED);
++    CHECK(dash_observation_max_error < 1e-6f);
++
++    for (int decision = 0; decision < 100; ++decision) {
++        int32_t first_action[GDX_RL_ACTION_SIZE] = {
++            decision % GDX_RL_STEER_BINS,
++            decision % GDX_RL_PITCH_BINS,
++            decision & 1,
++            (decision >> 1) & 1,
++            (decision % 17) == 0,
++        };
++        int32_t second_action[GDX_RL_ACTION_SIZE];
++        std::memcpy(second_action, first_action, sizeof(second_action));
++        FZeroGpuStepResult a =
++            fzero_gpu_step_state(&first, &config, course.data(), first_action);
++        FZeroGpuStepResult b =
++            fzero_gpu_step_state(&second, &config, course.data(), second_action);
++        CHECK(std::memcmp(&a, &b, sizeof(a)) == 0);
++        CHECK(std::memcmp(&first, &second, sizeof(first)) == 0);
++        if (a.terminated || a.truncated) {
++            break;
++        }
++    }
++
++    FZeroGpuState pilot = {};
++    fzero_gpu_reset_state(&pilot, &config, 0);
++    FZeroGpuStepResult pilot_result = {};
++    float pilot_observation[GDX_RL_OBSERVATION_SIZE] = {};
++    int pilot_decisions = 0;
++    while (!pilot_result.terminated && !pilot_result.truncated && pilot_decisions < 5000) {
++        observe(pilot, config, course, dash_pads, pilot_observation);
++        float desired_track_yaw = std::atan2(
++            pilot_observation[48], std::max(0.1f, pilot_observation[47]));
++        float target_yaw = desired_track_yaw - pilot.lateral * 0.0015f;
++        float desired = 63.0f *
++            (pilot.yaw - target_yaw) /
++            (config.steering_rate * (float)config.action_repeat);
++        desired = std::max(-63.0f, std::min(63.0f, desired));
++        int32_t action[GDX_RL_ACTION_SIZE] = {
++            nearest_steer_category(desired), 0, 1, 0, 0,
++        };
++        pilot_result = fzero_gpu_step_state(&pilot, &config, course.data(), action);
++        pilot_decisions++;
++    }
++    if (!pilot_result.terminated || pilot_result.reason != FZERO_GPU_FINISHED) {
++        std::fprintf(stderr,
++            "reduced pilot failed: reason=%d decisions=%d frames=%u distance=%.3f "
++            "lateral=%.3f yaw=%.6f speed=%.3f\n",
++            pilot_result.reason, pilot_decisions, pilot.episode_frame,
++            pilot.race_distance, pilot.lateral, pilot.yaw, pilot.speed);
++        return 1;
++    }
++    CHECK_NEAR(pilot_result.learner_reward,
++        fzero_gpu_terminal_outcome(FZERO_GPU_FINISHED, pilot.episode_frame,
++            config.finish_time_target_frames), 0.0f);
++
++    FZeroGpuConfig no_op_config = config;
++    no_op_config.steering_curriculum = 0;
++    FZeroGpuState no_op = {};
++    fzero_gpu_reset_state(&no_op, &no_op_config, 0);
++    FZeroGpuStepResult no_op_result = {};
++    int32_t no_op_action[GDX_RL_ACTION_SIZE] = {};
++    int no_op_decisions = 0;
++    while (!no_op_result.terminated && !no_op_result.truncated && no_op_decisions < 1000) {
++        no_op_result = fzero_gpu_step_state(
++            &no_op, &no_op_config, course.data(), no_op_action);
++        no_op_decisions++;
++    }
++    CHECK(no_op_result.truncated);
++    CHECK(no_op_result.reason == FZERO_GPU_STALLED);
++    CHECK(no_op.episode_frame == (uint32_t)no_op_config.stall_frames);
++    CHECK_NEAR(no_op_result.learner_reward, 0.0f, 0.0f);
++
++    std::printf("FZERO_GPU_CORE_OK initial_max_error=%.6f dash_max_error=%.9f "
++                "pilot_decisions=%d "
++                "pilot_frames=%u race_distance=%.3f no_op_decisions=%d\n",
++        initial_max_error, dash_observation_max_error, pilot_decisions, pilot.episode_frame,
++        pilot.race_distance, no_op_decisions);
++    return 0;
++}
+diff --git a/ocean/robot_arm/robot_arm.cu b/ocean/robot_arm/robot_arm.cu
+index 25a0b832..d5a43e2f 100755
+--- a/ocean/robot_arm/robot_arm.cu
++++ b/ocean/robot_arm/robot_arm.cu
+@@ -45,7 +45,9 @@ static void ra_fill(Env* env, unsigned int rng) {
+ }
+ 
+ Env* puf_vec_create(int n, Dict* env_kwargs,
+-        obs_t* observations, float* actions, float* rewards, float* terminals) {
++        obs_t* observations, float* actions, float* rewards, float* terminals,
++        unsigned char* action_mask) {
++    (void)action_mask;
+     g_ra_no_timeout = ra_flag(env_kwargs, "no_timeout");
+     g_ra_stack = ra_flag(env_kwargs, "stack");
+     g_ra_basketball = ra_flag(env_kwargs, "basketball");
+diff --git a/src/puffercpu.c b/src/puffercpu.c
+index fbd4907d..d784976c 100644
+--- a/src/puffercpu.c
++++ b/src/puffercpu.c
+@@ -4,6 +4,7 @@
+ #include <string.h>
+ #include <math.h>
+ #include <assert.h>
++#include <stdint.h>
+ #include <sys/stat.h>
+ #include <dirent.h>
+ #include <time.h>
+@@ -720,6 +721,19 @@ static const char* puf_model_path(const char* env_name, const char* cli_path,
+     return out;
+ }
+ 
++static int puf_parse_u32(const char* text, uint32_t* output) {
++    if (text == NULL || text[0] == '\0' || output == NULL || text[0] == '-') {
++        return 0;
++    }
++    char* end = NULL;
++    unsigned long value = strtoul(text, &end, 0);
++    if (end == text || *end != '\0' || value > UINT32_MAX) {
++        return 0;
++    }
++    *output = (uint32_t)value;
++    return 1;
++}
++
+ int main(int argc, char** argv) {
+     const char* env_name = PUFFER_ENV_NAME;
+     int argi = 1;
+@@ -733,6 +747,8 @@ int main(int argc, char** argv) {
+     int headless = 0;
+     const char* cli_path = NULL;
+     int cli_latest = 0;
++    const char* gdx_input_script_path = NULL;
++    uint32_t gdx_sampler_seed = UINT32_C(1);
+ 
+     char* ini_argv[argc > 0 ? (size_t)argc : 1];
+     int ini_argc = 0;
+@@ -741,6 +757,25 @@ int main(int argc, char** argv) {
+             headless = 1;
+             continue;
+         }
++        if (strncmp(argv[i], "--gdx-input-script=", 19) == 0) {
++            gdx_input_script_path = argv[i] + 19;
++            continue;
++        }
++        if (strcmp(argv[i], "--gdx-input-script") == 0) {
++            if (++i >= argc) {
++                fprintf(stderr, "--gdx-input-script requires an output path\n");
++                return 2;
++            }
++            gdx_input_script_path = argv[i];
++            continue;
++        }
++        if (strncmp(argv[i], "--gdx-sampler-seed=", 19) == 0) {
++            if (!puf_parse_u32(argv[i] + 19, &gdx_sampler_seed)) {
++                fprintf(stderr, "invalid --gdx-sampler-seed: %s\n", argv[i] + 19);
++                return 2;
++            }
++            continue;
++        }
+         if (strcmp(argv[i], "latest") == 0) {
+             cli_latest = 1;
+             continue;
+@@ -752,9 +787,39 @@ int main(int argc, char** argv) {
+         }
+         ini_argv[ini_argc++] = argv[i];
+     }
++#ifdef PUF_SUPPORTS_GDX_INPUT_SCRIPT
++    if (gdx_input_script_path != NULL) {
++        /* Seed before configuration and environment initialization so seed 1
++         * reproduces C's default stream, including deterministic startup
++         * consumption before the first policy sample. */
++        srand(gdx_sampler_seed);
++    }
++#endif
+     puf_ini_load_env(&ini, env_name, ini_argc, ini_argv);
+     int eval_episodes = (int)puf_ini_get(&ini, "base", "eval_episodes");
+ 
++    if (gdx_input_script_path != NULL) {
++#ifndef PUF_SUPPORTS_GDX_INPUT_SCRIPT
++        fprintf(stderr, "%s does not support --gdx-input-script\n", env_name);
++        return 2;
++#else
++        if (gdx_input_script_path[0] == '\0') {
++            fprintf(stderr, "--gdx-input-script output path is empty\n");
++            return 2;
++        }
++        if (!headless) {
++            fprintf(stderr, "--gdx-input-script requires --headless\n");
++            return 2;
++        }
++        if (eval_episodes != 1) {
++            fprintf(stderr,
++                "--gdx-input-script requires --base.eval_episodes=1 (got %d)\n",
++                eval_episodes);
++            return 2;
++        }
++#endif
++    }
++
+     int act_sizes[] = ACT_SIZES;
+     int num_actions = (int)(sizeof(act_sizes) / sizeof(act_sizes[0]));
+     char path_buf[1024];
+@@ -776,6 +841,10 @@ int main(int argc, char** argv) {
+ #endif
+     assert(!weights || (need - file_floats <= 7 && file_floats <= need));
+     int have_net = weights != NULL;
++    if (gdx_input_script_path != NULL && !have_net) {
++        fprintf(stderr, "--gdx-input-script requires a policy checkpoint\n");
++        return 2;
++    }
+     if (headless) {
+         printf("CPU_META env=%s path=%s file_floats=%d need=%d untrained=%d hidden=%d layers=%d\n",
+             env_name, path ? path : "-", file_floats, need, !have_net,
+@@ -827,6 +896,17 @@ int main(int argc, char** argv) {
+     }
+     puf_reset(&env);
+ 
++#ifdef PUF_SUPPORTS_GDX_INPUT_SCRIPT
++    if (gdx_input_script_path != NULL) {
++        if (env.num_agents != 1) {
++            fprintf(stderr, "--gdx-input-script requires exactly one agent\n");
++            return 2;
++        }
++        fzero_gdx_input_trace_open(
++            &env, gdx_input_script_path, path, gdx_sampler_seed);
++    }
++#endif
++
+ #ifdef PUF_NMMO3_NET
+     MMONet* net = NULL;
+     if (have_net) {
+@@ -963,6 +1043,19 @@ int main(int argc, char** argv) {
+         fflush(stdout);
+     }
+ 
++#ifdef PUF_SUPPORTS_GDX_INPUT_SCRIPT
++    if (gdx_input_script_path != NULL) {
++        if (!fzero_gdx_input_trace_complete(&env)) {
++            fprintf(stderr, "GDX input script did not reach an episode boundary\n");
++            return 1;
++        }
++        printf("CPU_GDX_INPUT_SCRIPT path=%s decisions=%u env_seed=%u sampler_seed=%u complete=1\n",
++            gdx_input_script_path, env.gdx_input_trace->decisions,
++            env.gdx_input_trace->reset_seed, env.gdx_input_trace->sampler_seed);
++        fflush(stdout);
++    }
++#endif
++
+     puf_close(&env);
+     puf_ini_free(&ini);
+     return 0;
+diff --git a/src/pufferl.cu b/src/pufferl.cu
+index ed626585..b5eb34b3 100644
+--- a/src/pufferl.cu
++++ b/src/pufferl.cu
+@@ -968,7 +968,7 @@ static void env_log_sum(VecEnv* vec, Log* out, int clear) {
+ 
+ #if PUF_BACKEND != PUF_GPU
+ static void puf_bind_stream(cudaStream_t) {}
+-static Env* puf_vec_create(int, Dict*, obs_t*, float*, float*, float*) {
++static Env* puf_vec_create(int, Dict*, obs_t*, float*, float*, float*, unsigned char*) {
+     return NULL;
+ }
+ #endif
+@@ -979,7 +979,8 @@ static void env_setup(PuffeRL* p, VecEnv* vec, Dict* vk, Dict* ek) {
+         vec->size = vec->total_agents;
+         vec->envs = puf_vec_create(vec->total_agents, ek,
+             p->env.obs.data, p->env.actions.data,
+-            p->env.rewards.data, p->env.terminals.data);
++            p->env.rewards.data, p->env.terminals.data,
++            p->env.action_mask.data);
+         cudaMalloc((void**)&vec->log_scratch, sizeof(Log));
+         cudaMemset(vec->log_scratch, 0, sizeof(Log));
+         vec->policy_layout[0] = 0;
+@@ -2568,6 +2569,12 @@ void run_sweep(Ini* ini, const char* exe_path) {
+         if (strncmp(dict->name, "sweep.", 6) != 0) {
+             continue;
+         }
++        /* Environment overlays may disable inherited sweep dimensions whose
++         * independent suggestions would violate coupled layout constraints. */
++        DictItem* enabled = dict_find(dict, "enabled");
++        if (enabled != NULL && enabled->value == 0.0) {
++            continue;
++        }
+         const char* path = dict->name + 6;
+         const char* dot = strrchr(path, '.');
+         assert(dot && dot != path && dot[1]
+@@ -2974,6 +2981,15 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
+     }
+ 
+     PuffeRL* pufferl = create_pufferl(ini, ctx);
++    char warm_start_buf[4096];
++    const char* warm_start = puf_checkpoint_path_key(
++        ini, "load_model_path", warm_start_buf, sizeof(warm_start_buf));
++    if (warm_start != NULL) {
++        pufferl_load_policy(pufferl, 0, warm_start);
++        if (ctx->artifact_owner) {
++            printf("TRAIN_WARM_START path=%s weights_only=1 global_step=0\n", warm_start);
++        }
++    }
+     Selfplay selfplay = {0};
+     if (use_selfplay) {
+         char initial_checkpoint[4096];
+@@ -3150,6 +3166,21 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
+         puf_log_history_add(&log_history, &last_log);
+     }
+ 
++    // The final interval may contain no completed episode, so vec_log can omit
++    // every env/* metric. Carry the latest completed-episode values into the
++    // final snapshot: system counters still reflect the final training step,
++    // while objective/reporting keys remain dense and retain their last known
++    // values instead of turning a successful run into a missing-key failure.
++    if (!dict_find(&last_log, target_key) && log_history.size > 0) {
++        Dict* prior = &log_history.items[log_history.size - 1];
++        for (int i = 0; i < prior->size; i++) {
++            DictItem* item = &prior->items[i];
++            if (!dict_find(&last_log, item->key)) {
++                dict_set(&last_log, item->key, item->value);
++            }
++        }
++    }
++
+     // TrainResult curve: bin-mean over log_history (same as artifact metrics).
+     result.cost = dict_get(&last_log, "uptime");
+     result.steps = dict_get(&last_log, "agent_steps");

@@ -1,0 +1,24 @@
+# Private game data and generated media
+/private/
+/videos/
+/capture-logs/
+*.z64
+*.n64
+*.v64
+*.ndd
+*.z64dd
+*.o2r
+*.otr
+*.mp4
+*.gif
+*.rgba
+*.fifo
+
+# Local checkouts and generated outputs
+/workspace/
+**/build/
+**/.venv/
+**/.uv-cache/
+**/logs/
+**/checkpoints/
+**/wandb/

@@ -1,0 +1,134 @@
+diff --git a/src/audio/rom/lib/load.c b/src/audio/rom/lib/load.c
+index 78091d8..0e3fbc0 100644
+--- a/src/audio/rom/lib/load.c
++++ b/src/audio/rom/lib/load.c
+@@ -1422,20 +1422,36 @@ void AudioLoad_RelocateFontAndPreloadSamples(s32 fontId, uintptr_t fontDataAddr,
+ 
+ bool AudioLoad_ProcessSamplePreloads(s32 resetStatus) {
+     Sample* sample;
++#ifdef PORT
++    OSMesg preloadMsg;
+     u32 preloadIndex;
++#else
++    u32 preloadIndex;
++#endif
+     u32 key;
+     size_t size;
+     s32 nChunks;
+ 
+     if (gPreloadSampleStackTop > 0) {
+         if (resetStatus != 0) {
++#ifdef PORT
++            MQ_GET_MESG(&gPreloadSampleQueue, &preloadMsg);
++#else
+             MQ_GET_MESG(&gPreloadSampleQueue, &preloadIndex);
++#endif
+             gPreloadSampleStackTop = 0;
+             return false;
+         }
++#ifdef PORT
++        if (!MQ_GET_MESG(&gPreloadSampleQueue, &preloadMsg)) {
++            return false;
++        }
++        preloadIndex = (u32) (uintptr_t) preloadMsg;
++#else
+         if (!MQ_GET_MESG(&gPreloadSampleQueue, &preloadIndex)) {
+             return false;
+         }
++#endif
+         // "Receive %d\n"
+         preloadIndex >>= 0x18;
+ 
+diff --git a/src/audio/rom/lib/thread.c b/src/audio/rom/lib/thread.c
+index 4f39cd8..4eb8520 100644
+--- a/src/audio/rom/lib/thread.c
++++ b/src/audio/rom/lib/thread.c
+@@ -20,7 +20,13 @@ AudioTask* AudioThread_CreateTask(void) {
+     s16* aiBuffer;
+     s32 pad3C;
+     u32 specId;
++#ifdef PORT
++    /* osRecvMesg writes a pointer-width OSMesg. A u32 local is four bytes
++       too small on a 64-bit host and trips the stack canary. */
++    OSMesg msg;
++#else
+     u32 msg;
++#endif
+     s32 pad30;
+     s32 i;
+ 
+@@ -78,7 +84,7 @@ AudioTask* AudioThread_CreateTask(void) {
+     i = 0;
+     if (gResetStatus == 0) {
+         while (MQ_GET_MESG(gThreadCmdProcQueuePtr, &msg)) {
+-            AudioThread_ProcessCmds(msg);
++            AudioThread_ProcessCmds((u32) (uintptr_t) msg);
+             i++;
+         }
+         if (i == 0 && gThreadCmdQueueFinished) {
+@@ -412,12 +418,23 @@ static char devstr20[] = "Normal SpecChange [num %d]\n";
+ static char devstr21[] = "Undefined Port Command %d\n";
+ 
+ u32 AudioThread_GetAsyncLoadStatus(u32* outData) {
++#ifdef PORT
++    OSMesg loadMesg;
++    u32 loadStatus;
++
++    if (!MQ_GET_MESG(&gExternalLoadQueue, &loadMesg)) {
++        *outData = 0;
++        return 0;
++    }
++    loadStatus = (u32) (uintptr_t) loadMesg;
++#else
+     u32 loadStatus;
+ 
+     if (!MQ_GET_MESG(&gExternalLoadQueue, &loadStatus)) {
+         *outData = 0;
+         return 0;
+     }
++#endif
+     *outData = loadStatus & 0xFFFFFF;
+     return loadStatus >> 0x18;
+ }
+@@ -428,11 +445,21 @@ u8* AudioThread_GetFontsForSequence(s32 seqId, u32* outNumFonts) {
+ 
+ bool AudioThread_ResetComplete(void) {
+     s32 pad;
++#ifdef PORT
++    OSMesg specMsg;
++    s32 specId;
++
++    if (!MQ_GET_MESG(gAudioResetQueuePtr, &specMsg)) {
++        return false;
++    }
++    specId = (s32) (uintptr_t) specMsg;
++#else
+     s32 specId;
+ 
+     if (!MQ_GET_MESG(gAudioResetQueuePtr, &specId)) {
+         return false;
+     }
++#endif
+     if (specId != gSpecId) {
+         return false;
+     }
+diff --git a/src/overlays/ovl_i2/race.c b/src/overlays/ovl_i2/race.c
+index 588f4a9..d93e574 100644
+--- a/src/overlays/ovl_i2/race.c
++++ b/src/overlays/ovl_i2/race.c
+@@ -114,6 +114,15 @@ void Race_Init(void) {
+ }
+ 
+ s32 Race_Update(void) {
++#if defined(GDX_RL_HEADLESS) || defined(GDX_RL_RENDER_EVAL_SUPPORT)
++    /* A retry rebuilds racers/cameras/effects and performs blocking N64 queue operations. Keep it
++       on the cooperative game fiber; the external RL/render driver only posts the process-local
++       request. Each build supplies gdx_rl_game_thread_reset from its own host layer. */
++    extern s32 gdx_rl_game_thread_reset(void);
++    if (gdx_rl_game_thread_reset()) {
++        return gGameMode;
++    }
++#endif
+     Menus_Update();
+     Effects_Update();
+     Racer_Update();
