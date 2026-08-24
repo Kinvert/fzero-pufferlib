@@ -1,5 +1,7 @@
 # F-Zero X for PufferLib 5.0
 
+This is mostly vibed. So far mostly Codex.
+
 A headless, trainable F-Zero X reinforcement-learning environment for
 PufferLib 5.0, with an exact G-Diffuser CPU reference environment, a reduced
 batched CUDA simulator, deterministic graphical policy replay, and direct
